@@ -1,2 +1,2 @@
 # WeChat-outputer
-一个基于python和sqlite的离线微信聊天记录导出项目
+一个基于python和sqlite的离线wxchathistory导出项目
