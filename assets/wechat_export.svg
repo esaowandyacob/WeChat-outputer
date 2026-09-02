@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#19d878"/>
+      <stop offset="1" stop-color="#05a953"/>
+    </linearGradient>
+    <linearGradient id="arrow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fff9"/>
+      <stop offset="1" stop-color="#c9f5d8"/>
+    </linearGradient>
+  </defs>
+  <!-- 透明边距和手工圆角，避免使用任何微信商标元素。 -->
+  <rect x="40" y="40" width="432" height="432" rx="104" fill="url(#tile)"/>
+  <path d="M256 113v202m0 0-76-76m76 76 76-76" fill="none" stroke="url(#arrow)" stroke-linecap="round" stroke-linejoin="round" stroke-width="38"/>
+  <path d="M143 379h226" fill="none" stroke="#baf1ce" stroke-linecap="round" stroke-width="24" opacity=".9"/>
+</svg>

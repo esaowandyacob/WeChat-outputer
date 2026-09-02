@@ -1,0 +1,9 @@
+name: wechat_sqlite
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.14
+  - pip
+  - zstandard
+  # SQLCipher 在部分 macOS 架构上可能需用 brew 安装，故这里不强制锁定。
