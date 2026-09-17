@@ -546,6 +546,7 @@ def _capture_keys_windows(
     from windows_memory_probe import (
         WindowsProbeError,
         format_memory_scan_report,
+        is_current_user_admin,
         list_windows_wechat_processes,
         python_pointer_bits,
         scan_wechat_process_memory,
@@ -570,6 +571,10 @@ def _capture_keys_windows(
         bits = python_pointer_bits()
         extra_lines.append(f"SQLCipher 驱动：{'有' if find_sqlcipher_driver() else '无'}")
         extra_lines.append(f"SQLCipher CLI：{'有' if find_sqlcipher_executable() else '无'}")
+        admin = is_current_user_admin()
+        extra_lines.append(
+            "管理员：" + ("是" if admin else "否") + ("。未提权时主进程（约 1GB）可能有页面读不到。" if admin is False else "")
+        )
         if bits < 64:
             error = f"当前 Python 是 {bits} 位，无法读取 64 位微信进程。请改用 64 位 Python。"
             report = error
@@ -597,33 +602,38 @@ def _capture_keys_windows(
         extra_lines.append(f"加密库 salt：{len(salts)} 个，明文/无法读头：{plaintext} 个")
         if salts:
             extra_lines.append("salt 样例：" + "、".join(list(salts)[:3]))
+        extra_lines.append("请优先看工作集最大的 PID 明细，不要看最小的辅助进程。")
         _notify(on_status, f"探针：已发现 {len(message_paths)} 个数据库，开始读进程内存")
-        targets = [int(pid)]
-        for item in processes:
-            if item.pid not in targets:
-                targets.append(item.pid)
-        last_stats = None
-        for target in targets:
+        ordered_processes = sorted(processes, key=lambda item: -item.working_set)
+        if not ordered_processes:
+            ordered_processes = []
+            extra_lines.append("未找到可扫描的微信进程")
+        process_reports: list[str] = []
+        for process in ordered_processes:
             if getattr(stop_event, "is_set", lambda: False)():
                 break
-            memory_keys, data_dirs, last_stats = scan_wechat_process_memory(
-                target,
+            memory_keys, data_dirs, stats = scan_wechat_process_memory(
+                process.pid,
                 salts=salts,
                 on_status=on_status,
                 stop_event=stop_event,
             )
-            process = next((item for item in processes if item.pid == target), None)
-            if process is not None and last_stats is not None:
-                last_stats.process_name = process.name
-                last_stats.version = process.version
-                last_stats.working_set = process.working_set
+            stats.process_name = process.name
+            stats.version = process.version
+            stats.working_set = process.working_set
             _attach_discovered_data_roots(validator, data_dirs)
+            extra_lines.append(
+                f"PID {process.pid} 工作集 {process.working_set}：密钥串 {len(memory_keys)}，"
+                f"读到 {stats.bytes_read} 字节，读失败 {stats.read_fail}，"
+                f"salt 二进制 {stats.salt_binary_hits}，x' 标记 {stats.ascii_x_markers}，"
+                f"x'后hex {stats.ascii_hex_lengths}"
+            )
             if data_dirs:
-                extra_lines.append("内存中的数据目录：" + "；".join(str(item) for item in data_dirs[:3]))
+                extra_lines.append("  数据目录：" + "；".join(str(item) for item in data_dirs[:5]))
+            process_reports.append(format_memory_scan_report(stats))
             ordered = [item.key_hex for item in memory_keys if item.salt_hex] + [
                 item.key_hex for item in memory_keys if not item.salt_hex
             ]
-            extra_lines.append(f"PID {target} 完整密钥串：{len(memory_keys)} 个")
             for candidate in ordered:
                 _validate_and_store_candidate(
                     candidate,
@@ -636,19 +646,19 @@ def _capture_keys_windows(
                     validated_records,
                 )
             if validated_records:
+                extra_lines.append(f"PID {process.pid} 已验证通过，停止扫描其余进程")
                 break
         extra_lines.append(f"验证通过：{len(validated_records)} 个，候选：{len(candidates)} 个")
-        if last_stats is not None:
-            report = format_memory_scan_report(last_stats, extra_lines)
-        else:
-            report = "\n".join(["=== Windows 密钥采集探针 ===", *extra_lines])
+        header = [
+            "=== Windows 密钥采集探针 ===",
+            *extra_lines,
+            "",
+            "--- 各进程明细 ---",
+        ]
+        report = "\n".join(header + process_reports)
         log_path = _write_probe_report(key_path, report)
         if log_path is not None:
-            extra_lines.append(f"完整日志：{log_path}")
-            if last_stats is not None:
-                report = format_memory_scan_report(last_stats, extra_lines)
-            else:
-                report = "\n".join(["=== Windows 密钥采集探针 ===", *extra_lines])
+            report = report + f"\n完整日志：{log_path}"
         if not validated_records:
             if not find_sqlcipher_driver() and not find_sqlcipher_executable():
                 error = "未找到 SQLCipher，请先执行 python -m pip install -r requirements.txt"

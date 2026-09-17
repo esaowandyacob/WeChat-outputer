@@ -20,7 +20,8 @@ from typing import Callable, Iterable, Mapping, Sequence
 WECHAT_PROCESS_NAMES = ("Weixin.exe", "WeChat.exe")
 HEX_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 HEX_SALT_RE = re.compile(r"^[0-9a-fA-F]{32}$")
-ASCII_KEY_RE = re.compile(rb"[xX]'([0-9a-fA-F]{64})([0-9a-fA-F]{32})?'")
+# 不强制结尾引号：上一份探针里 x' 出现 918 次，带引号的 64 hex 为 0。
+ASCII_KEY_RE = re.compile(rb"[xX]'([0-9a-fA-F]{64})([0-9a-fA-F]{32})?")
 ASCII_DATA_DIR_RE = re.compile(
     rb"[A-Za-z]:\\(?:[^\\\x00]{1,80}\\)*xwechat_files\\[0-9A-Za-z_-]{4,80}(?:\\db_storage)?",
     re.IGNORECASE,
@@ -123,11 +124,14 @@ class MemoryScanStats:
     salt_utf16_hits: int = 0
     salt_binary_hits: int = 0
     data_dir_hits: int = 0
+    ascii_hex_lengths: dict[str, int] = None  # type: ignore[assignment]
     notes: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.notes is None:
             self.notes = []
+        if self.ascii_hex_lengths is None:
+            self.ascii_hex_lengths = {}
 
 
 # 已知数据库 salt 若以十六进制出现在内存中，取其前面 64 个 hex 作为密钥文本。
@@ -213,20 +217,64 @@ def extract_hex_keys_from_bytes(data: bytes | bytearray | memoryview) -> list[st
     return [item.key_hex for item in extract_key_candidates_from_bytes(data)]
 
 
+# 把 x' 后面连续 hex 长度归到可比较的桶。
+def _hex_length_bucket(count: int) -> str:
+    if count <= 0:
+        return "0"
+    if count < 16:
+        return "1-15"
+    if count in {16, 32, 48, 64, 96}:
+        return str(count)
+    if count > 96:
+        return ">96"
+    return f"other:{count}"
+
+
+# 统计 ASCII x' 后紧跟的 hex 长度分布。
+def ascii_x_hex_length_histogram(data: bytes) -> dict[str, int]:
+    raw = bytes(data)
+    buckets: dict[str, int] = {}
+    start = 0
+    hex_digits = b"0123456789abcdefABCDEF"
+    while True:
+        first = raw.find(b"x'", start)
+        second = raw.find(b"X'", start)
+        candidates = [item for item in (first, second) if item >= 0]
+        if not candidates:
+            break
+        index = min(candidates)
+        position = index + 2
+        length = 0
+        while position < len(raw) and raw[position] in hex_digits:
+            length += 1
+            position += 1
+        bucket = _hex_length_bucket(length)
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+        start = index + 2
+    return buckets
+
+
 # 统计当前内存块里可观察的标记次数，避免和重叠窗口重复计算。
 def count_probe_markers(data: bytes, salts: Mapping[str, bytes] | None = None) -> dict[str, int]:
     raw = bytes(data)
-    ascii_keys = 0
-    utf16_keys = 0
-    for match in ASCII_KEY_RE.finditer(raw):
-        ascii_keys += 1
+    ascii_keys = len(list(ASCII_KEY_RE.finditer(raw)))
+    utf16_complete = 0
     for marker in (b"x\x00'\x00", b"X\x00'\x00"):
         start = 0
         while True:
             index = raw.find(marker, start)
             if index < 0:
                 break
-            utf16_keys += 1
+            position = index + len(marker)
+            hex_chars = 0
+            while position + 1 < len(raw) and hex_chars < 96:
+                character, zero = raw[position], raw[position + 1]
+                if zero != 0 or chr(character) not in "0123456789abcdefABCDEF":
+                    break
+                hex_chars += 1
+                position += 2
+            if hex_chars >= 64:
+                utf16_complete += 1
             start = index + 2
     salt_ascii = salt_utf16 = salt_binary = 0
     if salts:
@@ -234,15 +282,17 @@ def count_probe_markers(data: bytes, salts: Mapping[str, bytes] | None = None) -
             salt_ascii += raw.count(salt_hex.encode("ascii"))
             salt_utf16 += raw.count(salt_hex.encode("utf-16le"))
             salt_binary += raw.count(salt)
+    lengths = ascii_x_hex_length_histogram(raw)
     return {
         "ascii_x_markers": raw.count(b"x'") + raw.count(b"X'"),
         "utf16_x_markers": raw.count(b"x\x00'\x00") + raw.count(b"X\x00'\x00"),
         "ascii_key_hits": ascii_keys,
-        "utf16_key_hits": utf16_keys,
+        "utf16_key_hits": utf16_complete,
         "salt_ascii_hits": salt_ascii,
         "salt_utf16_hits": salt_utf16,
         "salt_binary_hits": salt_binary,
         "data_dir_hits": len(extract_data_dirs_from_bytes(raw)),
+        "ascii_hex_lengths": lengths,
     }
 
 
@@ -292,6 +342,11 @@ def format_memory_scan_report(stats: MemoryScanStats, extra_lines: Sequence[str]
                 f"已知库 salt：ASCII {stats.salt_ascii_hits}，UTF-16 {stats.salt_utf16_hits}，"
                 f"二进制 {stats.salt_binary_hits}"
             ),
+            "x' 后 hex 长度："
+            + (
+                "、".join(f"{name}={count}" for name, count in sorted(stats.ascii_hex_lengths.items()))
+                or "无"
+            ),
             f"xwechat_files 路径串：{stats.data_dir_hits}",
         ]
     )
@@ -317,13 +372,17 @@ def extract_data_dirs_from_bytes(data: bytes | bytearray | memoryview) -> list[s
         found.append(text)
 
     for match in ASCII_DATA_DIR_RE.finditer(raw):
-        add(match.group(0).decode("ascii", errors="ignore"))
+        text = match.group(0).decode("ascii", errors="ignore")
+        if "\\xwechat_files" in text.casefold() and ".dat" not in text.casefold():
+            add(text)
     try:
         utf16_text = raw.decode("utf-16le", errors="ignore")
     except Exception:
         utf16_text = ""
     for match in UTF16_DATA_DIR_RE.finditer(utf16_text):
-        add(match.group(0))
+        text = match.group(0)
+        if re.fullmatch(r"[A-Za-z]:\\[\w .\\-]*xwechat_files(?:\\[\w .\\-]*)?", text, re.I):
+            add(text)
     return found
 
 
@@ -900,6 +959,8 @@ def scan_wechat_process_memory(
         stats.salt_utf16_hits += markers["salt_utf16_hits"]
         stats.salt_binary_hits += markers["salt_binary_hits"]
         stats.data_dir_hits += markers["data_dir_hits"]
+        for name, count in markers["ascii_hex_lengths"].items():
+            stats.ascii_hex_lengths[name] = stats.ascii_hex_lengths.get(name, 0) + count
         for candidate in extract_key_candidates_from_bytes(payload, salts):
             _remember_key_candidate(keys, by_key, candidate.key_hex, candidate.salt_hex)
         for item in extract_data_dirs_from_bytes(payload):

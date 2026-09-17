@@ -39,6 +39,7 @@ from read_wechat_conversation import (
 )
 from windows_memory_probe import (
     MemoryScanStats,
+    ascii_x_hex_length_histogram,
     extract_data_dirs_from_bytes,
     extract_hex_keys_from_bytes,
     extract_key_candidates_from_bytes,
@@ -260,6 +261,8 @@ def test_extract_hex_keys_from_memory_bytes() -> None:
     assert extract_hex_keys_from_bytes(ascii_blob) == [key]
     with_salt = b"x'" + key.encode("ascii") + salt.encode("ascii") + b"'"
     assert extract_hex_keys_from_bytes(with_salt) == [key]
+    without_quote = b"x'" + key.encode("ascii") + b" trailing"
+    assert extract_hex_keys_from_bytes(without_quote) == [key]
     candidates = extract_key_candidates_from_bytes(with_salt)
     assert candidates[0].key_hex == key
     assert candidates[0].salt_hex == salt
@@ -272,6 +275,9 @@ def test_extract_hex_keys_from_memory_bytes() -> None:
     found = extract_keys_using_salts(nearby, {salt: salt_bytes})
     assert found[0].key_hex == key
     assert found[0].salt_hex == salt
+    histogram = ascii_x_hex_length_histogram(b"x'" + (b"ab" * 32) + b"zz x'abcd")
+    assert histogram.get("64") == 1
+    assert histogram.get("1-15") == 1
 
 
 # 验证探针报告包含可观察计数，不包含完整密钥。
