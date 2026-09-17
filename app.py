@@ -1,8 +1,9 @@
-"""macOS 微信本地聊天记录导出工具的 Tkinter 界面。"""
+"""微信本地聊天记录导出工具的 Tkinter 界面。"""
 
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import subprocess
 import sys
@@ -16,10 +17,10 @@ from cccryptor_probe import (
     CaptureResult,
     KeyStoreError,
     capture_keys,
-    check_dtrace_probe,
+    check_capture_probe,
     detect_wechat,
     ensure_key_path_outside_export,
-    get_sip_status,
+    get_capture_prerequisite,
     launch_wechat,
     load_key_records,
     redact_output,
@@ -35,11 +36,33 @@ from read_wechat_conversation import (
 
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
+UI_FONT = "Microsoft YaHei UI" if sys.platform == "win32" else "PingFang SC"
 EXPORT_COLORS = {
     "html": ("#07C160", "#06AD56"),
     "text": ("#2787F5", "#1677E6"),
     "sqlite": ("#8B5CF6", "#7546DD"),
 }
+
+
+# 返回当前平台默认的导出目录。
+def _default_export_dir() -> Path:
+    desktop = Path.home() / "Desktop"
+    if desktop.is_dir():
+        return desktop / "WeChatExport"
+    return Path.home() / "WeChatExport"
+
+
+# 第一步采集说明：macOS 需要关闭 SIP，Windows 需要可读进程内存。
+def _capture_hint_text() -> str:
+    if sys.platform == "win32":
+        return (
+            "请先启动并登录微信 4.x（进程名为 Weixin.exe）。采集会只读扫描当前用户的微信进程内存以寻找"
+            "数据库密钥，不会修改微信文件。若提示拒绝访问，请以管理员身份重新运行本工具。"
+        )
+    return (
+        "SIP 关闭说明：请在 macOS 恢复模式打开“终端”，执行 csrutil disable，重启后回到此页刷新。"
+        "程序不会自动修改 SIP；完成采集后可自行重新启用。"
+    )
 
 
 # 将后台异常转换为不会回显完整密钥的 GUI 文本。
@@ -49,7 +72,7 @@ def _safe_error_message(error: Exception) -> str:
 
 
 class FlatButton(tk.Label):
-    """用 Label 模拟跨 macOS Aqua 主题稳定着色的按钮。"""
+    """用 Label 模拟跨平台稳定着色的按钮。"""
 
     # 创建一个支持 hover、禁用和 invoke 的扁平按钮。
     def __init__(
@@ -165,7 +188,9 @@ class WeChatExportApp(tk.Tk):
         self.geometry("900x650")
         self.minsize(760, 540)
         self.configure(bg="#F5F6F7")
-        self.reader = reader or WeChatReader(key_path=key_path)
+        env_root = os.environ.get("WECHAT_DATA_ROOT", "").strip()
+        self.data_root = Path(env_root).expanduser() if env_root else None
+        self.reader = reader or WeChatReader(data_root=self.data_root, key_path=key_path)
         self.key_path = Path(key_path).expanduser()
         self.key_records = []
         self._captured_masks: list[str] = []
@@ -192,8 +217,8 @@ class WeChatExportApp(tk.Tk):
         style = ttk.Style(self)
         with contextlib.suppress(tk.TclError):
             style.theme_use("clam")
-        style.configure("WeChat.Treeview", rowheight=34, font=("PingFang SC", 13))
-        style.configure("WeChat.Treeview.Heading", font=("PingFang SC", 12, "bold"))
+        style.configure("WeChat.Treeview", rowheight=34, font=(UI_FONT, 13))
+        style.configure("WeChat.Treeview.Heading", font=(UI_FONT, 12, "bold"))
 
     # 尝试加载 PNG 与 ICNS 图标；任何平台不支持时都静默回退。
     def _build_icon(self) -> None:
@@ -217,7 +242,7 @@ class WeChatExportApp(tk.Tk):
             text="微信聊天记录导出",
             bg="#FFFFFF",
             fg="#1F2329",
-            font=("PingFang SC", 18, "bold"),
+            font=(UI_FONT, 18, "bold"),
         ).pack(side="left", padx=24)
         self.refresh_button = tk.Label(
             self.header,
@@ -237,17 +262,17 @@ class WeChatExportApp(tk.Tk):
     def _build_key_step(self) -> None:
         frame = tk.Frame(self.body, bg="#F5F6F7")
         self.step_frames.append(frame)
-        tk.Label(frame, text="第一步：获取密钥", bg="#F5F6F7", fg="#1F2329", font=("PingFang SC", 17, "bold")).pack(anchor="w")
+        tk.Label(frame, text="第一步：获取密钥", bg="#F5F6F7", fg="#1F2329", font=(UI_FONT, 17, "bold")).pack(anchor="w")
         tk.Label(
             frame,
             text="所有数据只在本机读取；密钥不会写入导出目录。",
             bg="#F5F6F7",
             fg="#737A81",
-            font=("PingFang SC", 11),
+            font=(UI_FONT, 11),
         ).pack(anchor="w", pady=(5, 18))
         tk.Label(
             frame,
-            text="SIP 关闭说明：请在 macOS 恢复模式打开“终端”，执行 csrutil disable，重启后回到此页刷新。程序不会自动修改 SIP；完成采集后可自行重新启用。",
+            text=_capture_hint_text(),
             bg="#FFF8E6",
             fg="#795548",
             justify="left",
@@ -256,7 +281,7 @@ class WeChatExportApp(tk.Tk):
             padx=12,
             pady=9,
         ).pack(fill="x", pady=(0, 12))
-        self.sip_var = tk.StringVar(value="正在检测 SIP 状态…")
+        self.sip_var = tk.StringVar(value="正在检测采集条件…")
         self.wechat_var = tk.StringVar(value="正在检测微信客户端…")
         self.capture_var = tk.StringVar(value="尚未启动密钥采集")
         self.sip_detail_var = tk.StringVar(value="")
@@ -272,13 +297,22 @@ class WeChatExportApp(tk.Tk):
         self.capture_button = self.capture_row.winfo_children()[-1]
         path_box = tk.Frame(frame, bg="#FFFFFF", padx=14, pady=12)
         path_box.pack(fill="x", pady=(22, 10))
-        tk.Label(path_box, text="密钥文件路径", bg="#FFFFFF", fg="#56606A", font=("PingFang SC", 11)).pack(anchor="w")
+        tk.Label(path_box, text="密钥文件路径", bg="#FFFFFF", fg="#56606A", font=(UI_FONT, 11)).pack(anchor="w")
         path_line = tk.Frame(path_box, bg="#FFFFFF")
         path_line.pack(fill="x", pady=(5, 0))
         self.key_path_var = tk.StringVar(value=str(self.key_path))
         tk.Entry(path_line, textvariable=self.key_path_var, state="readonly", relief="flat", readonlybackground="#FFFFFF", fg="#30363B").pack(side="left", fill="x", expand=True)
         FlatButton(path_line, "选择路径", self._choose_key_path, background="#E8F8EF", hover_background="#D7F3E4", foreground="#078A4A").pack(side="right")
-        tk.Label(frame, text="本次运行捕获的密钥（已脱敏）", bg="#F5F6F7", fg="#56606A", font=("PingFang SC", 11)).pack(anchor="w", pady=(10, 4))
+        data_box = tk.Frame(frame, bg="#FFFFFF", padx=14, pady=12)
+        data_box.pack(fill="x", pady=(0, 10))
+        tk.Label(data_box, text="微信数据目录（可留空自动检测）", bg="#FFFFFF", fg="#56606A", font=(UI_FONT, 11)).pack(anchor="w")
+        data_line = tk.Frame(data_box, bg="#FFFFFF")
+        data_line.pack(fill="x", pady=(5, 0))
+        self.data_root_var = tk.StringVar(value=str(self.data_root) if self.data_root else "自动检测")
+        tk.Entry(data_line, textvariable=self.data_root_var, state="readonly", relief="flat", readonlybackground="#FFFFFF", fg="#30363B").pack(side="left", fill="x", expand=True)
+        FlatButton(data_line, "自动检测", self._clear_data_root, background="#EEF1F3", hover_background="#E1E6E9", foreground="#56606A").pack(side="right", padx=(8, 0))
+        FlatButton(data_line, "选择目录", self._choose_data_root, background="#E8F8EF", hover_background="#D7F3E4", foreground="#078A4A").pack(side="right")
+        tk.Label(frame, text="本次运行捕获的密钥（已脱敏）", bg="#F5F6F7", fg="#56606A", font=(UI_FONT, 11)).pack(anchor="w", pady=(10, 4))
         self.captured_list_var = tk.StringVar(value="暂无")
         tk.Label(frame, textvariable=self.captured_list_var, bg="#F5F6F7", fg="#30363B", justify="left", anchor="w", wraplength=760).pack(fill="x")
         bottom = tk.Frame(frame, bg="#F5F6F7")
@@ -303,8 +337,8 @@ class WeChatExportApp(tk.Tk):
     ) -> tk.Frame:
         row = tk.Frame(parent, bg="#FFFFFF", padx=14, pady=13)
         row.pack(fill="x", pady=4)
-        tk.Label(row, textvariable=variable, bg="#FFFFFF", fg="#1F2329", font=("PingFang SC", 12)).pack(side="left")
-        tk.Label(row, textvariable=detail_variable, bg="#FFFFFF", fg="#737A81", font=("PingFang SC", 10)).pack(side="left", padx=12)
+        tk.Label(row, textvariable=variable, bg="#FFFFFF", fg="#1F2329", font=(UI_FONT, 12)).pack(side="left")
+        tk.Label(row, textvariable=detail_variable, bg="#FFFFFF", fg="#737A81", font=(UI_FONT, 10)).pack(side="left", padx=12)
         if button_text:
             FlatButton(row, button_text, command, background="#E8F8EF", hover_background="#D7F3E4", foreground="#078A4A").pack(side="right")
         return row
@@ -315,7 +349,7 @@ class WeChatExportApp(tk.Tk):
         self.step_frames.append(frame)
         top = tk.Frame(frame, bg="#F5F6F7")
         top.pack(fill="x")
-        tk.Label(top, text="第二步：选择会话", bg="#F5F6F7", fg="#1F2329", font=("PingFang SC", 17, "bold")).pack(side="left")
+        tk.Label(top, text="第二步：选择会话", bg="#F5F6F7", fg="#1F2329", font=(UI_FONT, 17, "bold")).pack(side="left")
         FlatButton(top, "刷新", self._load_conversations, background="#E8F8EF", hover_background="#D7F3E4", foreground="#078A4A").pack(side="right")
         tk.Label(frame, text="公众号、服务通知和系统会话已隐藏。", bg="#F5F6F7", fg="#737A81").pack(anchor="w", pady=(5, 13))
         table_frame = tk.Frame(frame, bg="#FFFFFF")
@@ -345,9 +379,9 @@ class WeChatExportApp(tk.Tk):
     def _build_export_step(self) -> None:
         frame = tk.Frame(self.body, bg="#F5F6F7")
         self.step_frames.append(frame)
-        tk.Label(frame, text="第三步：导出", bg="#F5F6F7", fg="#1F2329", font=("PingFang SC", 17, "bold")).pack(anchor="w")
+        tk.Label(frame, text="第三步：导出", bg="#F5F6F7", fg="#1F2329", font=(UI_FONT, 17, "bold")).pack(anchor="w")
         self.export_conversation_var = tk.StringVar(value="")
-        tk.Label(frame, textvariable=self.export_conversation_var, bg="#F5F6F7", fg="#078A4A", font=("PingFang SC", 12)).pack(anchor="w", pady=(5, 18))
+        tk.Label(frame, textvariable=self.export_conversation_var, bg="#F5F6F7", fg="#078A4A", font=(UI_FONT, 12)).pack(anchor="w", pady=(5, 18))
         options = tk.Frame(frame, bg="#FFFFFF", padx=16, pady=14)
         options.pack(fill="x")
         row = tk.Frame(options, bg="#FFFFFF")
@@ -358,7 +392,7 @@ class WeChatExportApp(tk.Tk):
         row2 = tk.Frame(options, bg="#FFFFFF")
         row2.pack(fill="x", pady=(10, 3))
         tk.Label(row2, text="导出目录", bg="#FFFFFF", fg="#56606A").pack(side="left")
-        self.export_dir_var = tk.StringVar(value=str(Path.home() / "Desktop" / "WeChatExport"))
+        self.export_dir_var = tk.StringVar(value=str(_default_export_dir()))
         tk.Entry(row2, textvariable=self.export_dir_var, relief="solid", bd=1).pack(side="left", fill="x", expand=True, padx=14)
         FlatButton(row2, "选择目录", self._choose_export_dir, background="#EEF1F3", hover_background="#E1E6E9", foreground="#56606A").pack(side="right")
         button_box = tk.Frame(frame, bg="#F5F6F7")
@@ -371,7 +405,7 @@ class WeChatExportApp(tk.Tk):
             self.export_buttons[fmt] = button
         self.export_status_var = tk.StringVar(value="")
         tk.Label(frame, textvariable=self.export_status_var, bg="#F5F6F7", fg="#56606A", wraplength=760).pack(anchor="center", pady=(0, 8))
-        self.last_file_label = tk.Label(frame, text="", bg="#F5F6F7", fg="#078A4A", cursor="hand2", font=("PingFang SC", 11, "underline"))
+        self.last_file_label = tk.Label(frame, text="", bg="#F5F6F7", fg="#078A4A", cursor="hand2", font=(UI_FONT, 11, "underline"))
         self.last_file_label.pack(anchor="center")
         self.last_file_path: Path | None = None
         self.last_file_label.bind("<Button-1>", self._open_last_file)
@@ -392,18 +426,11 @@ class WeChatExportApp(tk.Tk):
             self.key_records = []
         self.key_count_var.set(f"已保存密钥：{len(self.key_records)} 个")
 
-    # 定时刷新 SIP 和微信进程状态。
+    # 定时刷新采集前置条件和微信进程状态。
     def refresh_status(self) -> None:
-        sip_enabled, _sip_detail = get_sip_status()
-        if sip_enabled is True:
-            self.sip_var.set("✅ 关闭 macOS SIP")
-            self.sip_detail_var.set("可进行 DTrace 采集")
-        elif sip_enabled is False:
-            self.sip_var.set("❌ 关闭 macOS SIP")
-            self.sip_detail_var.set("需在恢复模式手动关闭")
-        else:
-            self.sip_var.set("❌ 无法确认 macOS SIP 状态")
-            self.sip_detail_var.set("请在终端检查 csrutil status")
+        ready, headline, detail = get_capture_prerequisite()
+        self.sip_var.set(("✅ " if ready is True else "❌ ") + headline)
+        self.sip_detail_var.set(detail)
         status = detect_wechat()
         if status.running:
             self.wechat_var.set(f"✅ 启动微信客户端（已检测到 PID {status.pid}，版本 {status.version or '未知'}）")
@@ -441,7 +468,23 @@ class WeChatExportApp(tk.Tk):
         if selected:
             self.key_path = Path(selected).expanduser()
             self.key_path_var.set(str(self.key_path))
+            self.reader.key_path = self.key_path
             self._reload_keys()
+
+    # 手动指定微信 4.x 的 xwechat_files 或 db_storage 目录。
+    def _choose_data_root(self) -> None:
+        initial = str(self.data_root) if self.data_root is not None else str(Path.home())
+        selected = filedialog.askdirectory(title="选择微信数据目录", initialdir=initial)
+        if selected:
+            self.data_root = Path(selected).expanduser()
+            self.data_root_var.set(str(self.data_root))
+            self.reader.data_root = self.data_root
+
+    # 恢复按当前用户目录自动发现微信数据库。
+    def _clear_data_root(self) -> None:
+        self.data_root = None
+        self.data_root_var.set("自动检测")
+        self.reader.data_root = None
 
     # 二次确认后只删除本工具创建的密钥文件。
     def _reset_keys(self) -> None:
@@ -469,7 +512,12 @@ class WeChatExportApp(tk.Tk):
             capture_button.set_enabled(False)
         self.capture_var.set("⏳ 启动密钥采集（剩余 60 秒）")
         self._captured_masks = []
-        self.captured_list_var.set("正在监听，请在微信中登录并打开几个会话…")
+        listening_hint = (
+            "正在扫描微信进程内存，请保持微信已登录…"
+            if sys.platform == "win32"
+            else "正在监听，请在微信中登录并打开几个会话…"
+        )
+        self.captured_list_var.set(listening_hint)
 
         # 把采集倒计时安全地投递到 Tk 主线程。
         def on_tick(remaining: int) -> None:
@@ -488,11 +536,11 @@ class WeChatExportApp(tk.Tk):
         # 在后台线程先检查 DTrace probe，再开始 60 秒监听。
         def worker() -> None:
             try:
-                probe_ok, probe_detail = check_dtrace_probe(status.pid or 0)
+                probe_ok, probe_detail = check_capture_probe(status.pid or 0)
                 if not probe_ok:
                     self._post_ui(
                         lambda: self._capture_finished(
-                            CaptureResult((), (), 0.0, None, probe_detail or "DTrace probe 不可用"),
+                            CaptureResult((), (), 0.0, None, probe_detail or "密钥采集不可用"),
                             capture_button,
                         )
                     )
@@ -515,7 +563,7 @@ class WeChatExportApp(tk.Tk):
                     )
                 )
 
-        threading.Thread(target=worker, name="wechat-dtrace", daemon=True).start()
+        threading.Thread(target=worker, name="wechat-capture", daemon=True).start()
 
     # 处理采集线程结束结果并恢复按钮颜色。
     def _capture_finished(self, result: CaptureResult, capture_button: tk.Misc) -> None:
@@ -651,14 +699,17 @@ class WeChatExportApp(tk.Tk):
         for button in self.export_buttons.values():
             button.set_enabled(enabled)
 
-    # 用 macOS open 打开最近生成的文件；其他平台不执行外部命令。
+    # 用系统默认方式打开最近生成的导出文件。
     def _open_last_file(self, _event: tk.Event[tk.Misc]) -> None:
         if self.last_file_path is None or not self.last_file_path.exists():
             return
-        if sys.platform != "darwin":
-            return
         try:
-            subprocess.Popen(["open", str(self.last_file_path)])
+            if sys.platform == "win32":
+                os.startfile(self.last_file_path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(self.last_file_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(self.last_file_path)])
         except OSError:
             return
 

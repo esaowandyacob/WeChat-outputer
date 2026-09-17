@@ -16,6 +16,7 @@ from app import EXPORT_COLORS, WeChatExportApp
 from cccryptor_probe import (
     KeyRecord,
     build_dtrace_program,
+    default_key_path,
     load_key_records,
     mask_key,
     save_key_records,
@@ -27,9 +28,17 @@ from read_wechat_conversation import (
     WeChatReader,
     build_memory_model,
     decode_message_content,
+    default_wechat_data_roots,
+    discover_message_databases,
     export_html,
     export_sqlite,
     export_text,
+    find_sqlcipher_driver,
+)
+from windows_memory_probe import (
+    extract_data_dirs_from_bytes,
+    extract_hex_keys_from_bytes,
+    normalize_windows_data_root,
 )
 
 
@@ -105,7 +114,13 @@ def test_key_store_is_private(tmp_path: Path) -> None:
     save_key_records([KeyRecord(key, "2026-01-01T00:00:00+00:00", ("message_0.db",))], path)
     assert mask_key(key) == "01234567***89abcdef"
     assert load_key_records(path)[0].hex == key
-    assert os.stat(path).st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+# 验证运行时已安装可用的 SQLCipher Python 驱动。
+def test_sqlcipher_python_driver_is_available() -> None:
+    assert find_sqlcipher_driver() is not None
 
 
 # 验证 DTrace 脚本固定输出 32 个字节且包含精确过滤条件。
@@ -193,6 +208,57 @@ def test_gui_buttons_create_and_restore() -> None:
         assert tuple(app.conversation_tree["columns"]) == ("recent_time", "title", "recent_message")
     finally:
         app.destroy()
+
+
+# 验证密钥文件路径按平台落到各自的用户数据目录。
+def test_default_key_path_is_platform_specific(tmp_path: Path) -> None:
+    mac = default_key_path(tmp_path, platform="darwin")
+    win = default_key_path(tmp_path, platform="win32")
+    linux = default_key_path(tmp_path, platform="linux")
+    assert mac == tmp_path / "Library" / "Application Support" / "WeChatExport" / "wechat_cccryptor_keys.json"
+    assert win == tmp_path / "AppData" / "Roaming" / "WeChatExport" / "wechat_cccryptor_keys.json"
+    assert linux == tmp_path / ".config" / "WeChatExport" / "wechat_cccryptor_keys.json"
+
+
+# 验证 Windows 内存中的 ASCII / UTF-16 密钥文本都能提取为 32 字节 hex。
+def test_extract_hex_keys_from_memory_bytes() -> None:
+    key = "ab" * 32
+    ascii_blob = b"noise x'" + key.encode("ascii") + b"' more"
+    assert extract_hex_keys_from_bytes(ascii_blob) == [key]
+    with_salt = b"x'" + key.encode("ascii") + (b"cd" * 16) + b"'"
+    assert extract_hex_keys_from_bytes(with_salt) == [key]
+    utf16_blob = ("prefix x'" + key + "' suffix").encode("utf-16le")
+    assert extract_hex_keys_from_bytes(utf16_blob) == [key]
+
+
+# 验证 Windows 内存中的 xwechat_files 路径提取。
+def test_extract_data_dirs_from_memory_bytes() -> None:
+    path = r"C:\Users\me\Documents\xwechat_files\wxid_abc\db_storage"
+    ascii_hits = extract_data_dirs_from_bytes(b"xx" + path.encode("ascii") + b"yy")
+    utf16_hits = extract_data_dirs_from_bytes(path.encode("utf-16le"))
+    assert any("xwechat_files" in item and "wxid_abc" in item for item in ascii_hits)
+    assert any("xwechat_files" in item and "wxid_abc" in item for item in utf16_hits)
+
+
+# 验证微信文件管理路径会转换成 xwechat_files 根目录。
+def test_normalize_windows_data_root(tmp_path: Path) -> None:
+    documents = tmp_path / "Documents"
+    assert normalize_windows_data_root("MyDocument:", documents) == documents / "xwechat_files"
+    assert normalize_windows_data_root(str(tmp_path / "custom"), documents) == tmp_path / "custom" / "xwechat_files"
+    assert normalize_windows_data_root(str(tmp_path / "xwechat_files"), documents) == tmp_path / "xwechat_files"
+
+
+# 验证 Windows 4.x 文档目录布局可被自动发现。
+def test_discover_windows_message_databases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("read_wechat_conversation.sys.platform", "win32")
+    message_dir = tmp_path / "Documents" / "xwechat_files" / "wxid_me" / "db_storage" / "message"
+    message_dir.mkdir(parents=True)
+    database = message_dir / "message_0.db"
+    database.write_bytes(b"SQLite format 3\x00")
+    roots = default_wechat_data_roots(tmp_path)
+    assert tmp_path / "Documents" / "xwechat_files" in roots
+    found = discover_message_databases(home=tmp_path)
+    assert database.resolve() in found
 
 
 # 验证媒体模型可以独立承载音频二进制。

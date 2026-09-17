@@ -24,6 +24,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unicodedata
 import wave
@@ -335,9 +336,13 @@ def find_sqlcipher_executable() -> str | None:
     candidates.extend(
         [
             shutil.which("sqlcipher") or "",
+            shutil.which("sqlcipher.exe") or "",
             "/opt/homebrew/bin/sqlcipher",
             "/usr/local/bin/sqlcipher",
             "/opt/local/bin/sqlcipher",
+            str(Path(sys.prefix) / "Library" / "bin" / "sqlcipher.exe"),
+            str(Path(sys.prefix) / "bin" / "sqlcipher.exe"),
+            str(Path(sys.prefix) / "Scripts" / "sqlcipher.exe"),
         ]
     )
     for candidate in candidates:
@@ -452,13 +457,20 @@ def database_snapshot(paths: Iterable[Path | str]) -> Iterator[dict[Path, Path]]
         yield mapping
 
 
-# 从给定根目录扫描严格命名为 message_N.db 的消息分片。
-def discover_message_databases(data_root: Path | str | None = None, home: Path | None = None) -> list[Path]:
-    if data_root is not None:
-        roots = [Path(data_root).expanduser()]
-    else:
-        home_path = home if home is not None else Path.home()
-        roots = [
+# 返回当前平台常见的微信 4.x 数据根目录。
+def default_wechat_data_roots(home: Path | None = None) -> list[Path]:
+    home_path = home if home is not None else Path.home()
+    env_root = os.environ.get("WECHAT_DATA_ROOT", "").strip()
+    roots: list[Path] = []
+    if env_root:
+        roots.append(Path(env_root).expanduser())
+    if sys.platform == "win32":
+        from windows_memory_probe import list_windows_data_root_candidates
+
+        roots.extend(list_windows_data_root_candidates(home_path, include_system_folders=home is None))
+        return roots
+    roots.extend(
+        [
             home_path / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "xwechat_files",
             home_path
             / "Library"
@@ -470,6 +482,12 @@ def discover_message_databases(data_root: Path | str | None = None, home: Path |
             / "com.tencent.xinWeChat",
             home_path / "Library" / "Application Support" / "com.tencent.xinWeChat",
         ]
+    )
+    return roots
+
+
+# 在一组根目录中扫描严格命名为 message_N.db 的消息分片。
+def _scan_message_databases(roots: Iterable[Path]) -> list[Path]:
     discovered: list[Path] = []
     seen: set[Path] = set()
     for root in roots:
@@ -499,7 +517,27 @@ def discover_message_databases(data_root: Path | str | None = None, home: Path |
                 continue
             seen.add(resolved)
             discovered.append(resolved)
-    return sorted(discovered, key=lambda item: (str(item.parent), int(MESSAGE_FILE_RE.fullmatch(item.name).group(1))))
+    return discovered
+
+
+# 从给定根目录扫描严格命名为 message_N.db 的消息分片。
+def discover_message_databases(data_root: Path | str | None = None, home: Path | None = None) -> list[Path]:
+    if data_root is not None:
+        roots = [Path(data_root).expanduser()]
+    else:
+        roots = default_wechat_data_roots(home)
+    discovered = _scan_message_databases(roots)
+    if not discovered and data_root is None and home is None and sys.platform == "win32":
+        try:
+            from windows_memory_probe import list_running_wechat_data_dirs
+
+            discovered = _scan_message_databases(list_running_wechat_data_dirs())
+        except Exception:
+            discovered = []
+    return sorted(
+        discovered,
+        key=lambda item: (str(item.parent), int(MESSAGE_FILE_RE.fullmatch(item.name).group(1) or 0)),
+    )
 
 
 # 从消息库路径推导 4.x 账号根目录和相邻数据库路径。
@@ -1590,6 +1628,10 @@ class WeChatReader:
         normalized_keys = normalize_reader_keys(keys, self.key_path)
         catalog = self.catalog()
         if not catalog.message_paths:
+            if sys.platform == "win32":
+                raise ReaderError(
+                    "未找到 message_N.db；请确认已登录微信 4.x，或在界面选择数据目录 / 设置 WECHAT_DATA_ROOT"
+                )
             raise ReaderError("未找到 message_N.db；请确认微信 4.x 已登录并授予文件访问权限")
         all_paths = list(catalog.message_paths) + list(catalog.contact_paths) + list(catalog.session_paths) + list(catalog.resource_paths)
         with database_snapshot(all_paths) as snapshots:
@@ -2461,7 +2503,7 @@ def export_html(model: Mapping[str, Any], output_dir: Path | str) -> Path:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
 <style>
-:root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; }}
+:root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; }}
 body {{ margin: 0; background: #f5f6f7; color: #1f2329; }}
 .page {{ max-width: 920px; margin: 0 auto; padding: 28px 18px 48px; }}
 h1 {{ color: #07c160; font-size: 25px; margin: 0 0 6px; }}
@@ -2755,6 +2797,7 @@ __all__ = [
     "choose_column",
     "database_snapshot",
     "decode_message_content",
+    "default_wechat_data_roots",
     "decode_silk_to_wav",
     "deduplicate_messages",
     "discover_message_databases",

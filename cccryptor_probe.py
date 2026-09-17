@@ -1,9 +1,10 @@
-"""微信 macOS 进程密钥采集与本地密钥文件管理。
+"""微信进程密钥采集与本地密钥文件管理。
 
-本模块只负责三件事：检测系统/微信状态、通过 DTrace 读取候选密钥、
-以及把已经验证过的密钥安全地保存到本机。数据库读取和业务解析位于
-``read_wechat_conversation.py``，这样即使密钥采集失败也不会影响导出器的
-测试和离线使用。
+本模块只负责三件事：检测系统/微信状态、采集候选密钥、以及把已经验证
+过的密钥安全地保存到本机。macOS 使用 DTrace 监听 ``CCCryptorCreate``；
+Windows 只读扫描 ``Weixin.exe`` 进程内存中的 WCDB 密钥文本。数据库读取
+和业务解析位于 ``read_wechat_conversation.py``，这样即使密钥采集失败也
+不会影响导出器的测试和离线使用。
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import re
 import selectors
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -23,8 +25,6 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "WeChatExport"
-DEFAULT_KEY_PATH = APP_SUPPORT_DIR / "wechat_cccryptor_keys.json"
 WECHAT_EXECUTABLE = Path("/Applications/WeChat.app/Contents/MacOS/WeChat")
 WECHAT_INFO_PLIST = Path("/Applications/WeChat.app/Contents/Info.plist")
 PROBE_SPEC = "pid$target:*:CCCryptorCreate:entry"
@@ -44,7 +44,11 @@ class KeyStoreError(RuntimeError):
     """密钥文件格式或权限错误。"""
 
 
-class DTraceError(RuntimeError):
+class CaptureError(RuntimeError):
+    """密钥采集启动或运行错误。"""
+
+
+class DTraceError(CaptureError):
     """DTrace 探针启动或运行错误。"""
 
 
@@ -146,10 +150,29 @@ def redact_output(value: str | bytes) -> str:
     return re.sub(r"[0-9a-fA-F]{64}", "***", text)
 
 
-# 返回默认密钥文件路径，可在测试中注入不同 home 目录。
-def default_key_path(home: Path | None = None) -> Path:
+# 返回当前平台用于存放密钥文件的应用数据目录。
+def default_app_support_dir(home: Path | None = None, *, platform: str | None = None) -> Path:
+    return default_key_path(home, platform=platform).parent
+
+
+# 返回默认密钥文件路径，可在测试中注入不同 home 目录或平台。
+def default_key_path(home: Path | None = None, *, platform: str | None = None) -> Path:
+    system = platform or sys.platform
     base = home if home is not None else Path.home()
-    return base / "Library" / "Application Support" / "WeChatExport" / "wechat_cccryptor_keys.json"
+    filename = "wechat_cccryptor_keys.json"
+    if system == "win32":
+        if home is None:
+            appdata = os.environ.get("APPDATA", "").strip()
+            if appdata:
+                return Path(appdata) / "WeChatExport" / filename
+        return base / "AppData" / "Roaming" / "WeChatExport" / filename
+    if system == "darwin":
+        return base / "Library" / "Application Support" / "WeChatExport" / filename
+    return base / ".config" / "WeChatExport" / filename
+
+
+APP_SUPPORT_DIR = default_app_support_dir()
+DEFAULT_KEY_PATH = default_key_path()
 
 
 # 确保父目录由当前用户创建并尽量限制为仅用户可读写。
@@ -239,7 +262,9 @@ def save_key_records(records: Iterable[KeyRecord], path: Path | str = DEFAULT_KE
     fd, temporary_name = tempfile.mkstemp(prefix=f".{key_path.name}.", dir=str(key_path.parent))
     temporary_path = Path(temporary_name)
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
@@ -346,6 +371,17 @@ def build_dtrace_program() -> str:
     )
 
 
+# 检查当前平台是否具备采集密钥的进程访问条件。
+def check_capture_probe(pid: int, timeout: float = 8.0) -> tuple[bool, str]:
+    if sys.platform == "win32":
+        from windows_memory_probe import check_process_memory_access
+
+        return check_process_memory_access(int(pid))
+    if sys.platform == "darwin":
+        return check_dtrace_probe(pid, timeout)
+    return False, "当前系统不支持自动采集密钥"
+
+
 # 运行题目要求的 DTrace probe 列表检查，并返回脱敏后的诊断文本。
 def check_dtrace_probe(pid: int, timeout: float = 8.0) -> tuple[bool, str]:
     command = ["sudo", "dtrace", "-l", "-n", PROBE_SPEC, "-p", str(int(pid))]
@@ -393,8 +429,135 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
                 pass
 
 
-# 在指定微信 PID 上监听固定前缀的 key 行，并逐个调用验证器。
+# 按当前操作系统采集密钥：macOS 用 DTrace，Windows 扫描进程内存。
 def capture_keys(
+    pid: int,
+    validator: Callable[[str], Iterable[str]],
+    *,
+    duration: int = 60,
+    key_path: Path | str = DEFAULT_KEY_PATH,
+    on_tick: Callable[[int], object] | None = None,
+    on_candidate: Callable[[str], object] | None = None,
+    on_status: Callable[[str], object] | None = None,
+    stop_event: object | None = None,
+) -> CaptureResult:
+    if sys.platform == "win32":
+        return _capture_keys_windows(
+            pid,
+            validator,
+            duration=duration,
+            key_path=key_path,
+            on_tick=on_tick,
+            on_candidate=on_candidate,
+            on_status=on_status,
+            stop_event=stop_event,
+        )
+    if sys.platform == "darwin":
+        return _capture_keys_dtrace(
+            pid,
+            validator,
+            duration=duration,
+            key_path=key_path,
+            on_tick=on_tick,
+            on_candidate=on_candidate,
+            on_status=on_status,
+            stop_event=stop_event,
+        )
+    return CaptureResult((), (), 0.0, None, "当前系统不支持自动采集密钥")
+
+
+# 把采集到的候选密钥交给验证器，验证成功后写入本地密钥文件。
+def _validate_and_store_candidate(
+    candidate: str,
+    validator: Callable[[str], Iterable[str]],
+    key_path: Path | str,
+    on_candidate: Callable[[str], object] | None,
+    on_status: Callable[[str], object] | None,
+    seen: set[str],
+    candidates: list[str],
+    validated_records: list[KeyRecord],
+) -> None:
+    if candidate in seen:
+        return
+    seen.add(candidate)
+    candidates.append(candidate)
+    masked = mask_key(candidate)
+    _notify(on_candidate, masked)
+    try:
+        validated_names = validator(candidate)
+        if isinstance(validated_names, (str, os.PathLike)):
+            validated_names = (validated_names,)
+        database_names = tuple(sorted({Path(str(item)).name for item in validated_names if str(item).strip()}))
+    except Exception:
+        database_names = tuple()
+    if not database_names:
+        _notify(on_status, f"候选密钥 {masked} 未通过数据库验证")
+        return
+    record = save_validated_key(candidate, database_names, key_path)
+    validated_records.append(record)
+    _notify(on_status, f"候选密钥 {masked} 已验证并保存")
+
+
+# 只读扫描 Windows 微信进程内存中的 WCDB 密钥文本。
+def _capture_keys_windows(
+    pid: int,
+    validator: Callable[[str], Iterable[str]],
+    *,
+    duration: int = 60,
+    key_path: Path | str = DEFAULT_KEY_PATH,
+    on_tick: Callable[[int], object] | None = None,
+    on_candidate: Callable[[str], object] | None = None,
+    on_status: Callable[[str], object] | None = None,
+    stop_event: object | None = None,
+) -> CaptureResult:
+    from windows_memory_probe import WindowsProbeError, scan_process_memory_keys
+
+    started = time.monotonic()
+    candidates: list[str] = []
+    seen: set[str] = set()
+    validated_records: list[KeyRecord] = []
+    error: str | None = None
+    try:
+        deadline = started + max(0, int(duration))
+        _notify(on_status, "正在扫描微信进程内存")
+        while time.monotonic() <= deadline:
+            if getattr(stop_event, "is_set", lambda: False)():
+                break
+            remaining = max(0, int(deadline - time.monotonic() + 0.999))
+            _notify(on_tick, remaining)
+            keys = scan_process_memory_keys(int(pid), on_status=on_status, stop_event=stop_event)
+            for candidate in keys:
+                _validate_and_store_candidate(
+                    candidate,
+                    validator,
+                    key_path,
+                    on_candidate,
+                    on_status,
+                    seen,
+                    candidates,
+                    validated_records,
+                )
+            if validated_records or getattr(stop_event, "is_set", lambda: False)():
+                break
+            remaining_wait = deadline - time.monotonic()
+            if remaining_wait <= 0:
+                break
+            _notify(on_status, "尚未验证成功，等待微信加载数据库后重试")
+            time.sleep(min(3.0, remaining_wait))
+    except WindowsProbeError as exc:
+        error = redact_output(str(exc))
+    except (OSError, KeyStoreError) as exc:
+        error = redact_output(str(exc))
+    except Exception:
+        error = "密钥采集过程中发生未预期错误"
+    finally:
+        _notify(on_tick, 0)
+    elapsed = time.monotonic() - started
+    return CaptureResult(tuple(candidates), tuple(validated_records), elapsed, None, error)
+
+
+# 在指定微信 PID 上监听固定前缀的 key 行，并逐个调用验证器。
+def _capture_keys_dtrace(
     pid: int,
     validator: Callable[[str], Iterable[str]],
     *,
@@ -496,6 +659,31 @@ def capture_keys(
     return CaptureResult(tuple(candidates), tuple(validated_records), elapsed, returncode, error)
 
 
+# 返回采集前需要满足的环境条件，供界面展示。
+def get_capture_prerequisite() -> tuple[bool | None, str, str]:
+    if sys.platform == "win32":
+        from windows_memory_probe import is_current_user_admin, list_windows_wechat_processes
+
+        processes = list_windows_wechat_processes()
+        admin = is_current_user_admin()
+        if processes:
+            ok, detail = check_capture_probe(processes[0].pid)
+            if ok:
+                return True, "读取微信进程内存", "可进行内存密钥采集"
+            return False, "读取微信进程内存", detail
+        if admin is True:
+            return True, "管理员权限", "启动微信后可采集密钥"
+        if admin is False:
+            return False, "管理员权限", "若采集失败，请以管理员身份运行"
+        return None, "读取微信进程内存", "请启动并登录微信 4.x 后再采集"
+    sip_disabled, detail = get_sip_status()
+    if sip_disabled is True:
+        return True, "关闭 macOS SIP", "可进行 DTrace 采集"
+    if sip_disabled is False:
+        return False, "关闭 macOS SIP", "需在恢复模式手动关闭"
+    return None, "关闭 macOS SIP", detail or "请在终端检查 csrutil status"
+
+
 # 检查 macOS SIP 状态；返回值 True 表示已关闭，False 表示已开启。
 def get_sip_status() -> tuple[bool | None, str]:
     try:
@@ -519,8 +707,12 @@ def get_sip_status() -> tuple[bool | None, str]:
 
 
 # 从 ps 输出中查找精确的微信主程序 PID，避免误匹配辅助进程。
-def find_wechat_pid(executable: Path | str = WECHAT_EXECUTABLE) -> int | None:
-    executable_text = str(executable)
+def find_wechat_pid(executable: Path | str | None = None) -> int | None:
+    if sys.platform == "win32":
+        from windows_memory_probe import find_windows_wechat_pid
+
+        return find_windows_wechat_pid()
+    executable_text = str(executable or WECHAT_EXECUTABLE)
     try:
         completed = subprocess.run(
             ["ps", "-ax", "-o", "pid=,command="],
@@ -545,8 +737,12 @@ def find_wechat_pid(executable: Path | str = WECHAT_EXECUTABLE) -> int | None:
 
 
 # 读取微信 Info.plist 中的短版本号，读取失败时返回 None。
-def read_wechat_version(info_plist: Path | str = WECHAT_INFO_PLIST) -> str | None:
-    plist_path = Path(info_plist)
+def read_wechat_version(info_plist: Path | str | None = None) -> str | None:
+    if sys.platform == "win32":
+        from windows_memory_probe import find_windows_wechat_version
+
+        return find_windows_wechat_version()
+    plist_path = Path(info_plist or WECHAT_INFO_PLIST)
     if not plist_path.exists():
         return None
     try:
@@ -562,18 +758,31 @@ def read_wechat_version(info_plist: Path | str = WECHAT_INFO_PLIST) -> str | Non
 
 # 汇总微信是否运行、PID 和版本状态，供 GUI 定时刷新。
 def detect_wechat(
-    executable: Path | str = WECHAT_EXECUTABLE,
-    info_plist: Path | str = WECHAT_INFO_PLIST,
+    executable: Path | str | None = None,
+    info_plist: Path | str | None = None,
 ) -> WeChatStatus:
-    pid = find_wechat_pid(executable)
-    version = read_wechat_version(info_plist)
+    if sys.platform == "win32":
+        from windows_memory_probe import list_windows_wechat_processes
+
+        processes = list_windows_wechat_processes()
+        if not processes:
+            return WeChatStatus(False, None, None, "Weixin.exe", "未检测到微信主进程")
+        current = processes[0]
+        return WeChatStatus(True, current.pid, current.version, current.executable, "已检测到微信主进程")
+    target = Path(executable or WECHAT_EXECUTABLE)
+    pid = find_wechat_pid(target)
+    version = read_wechat_version(info_plist or WECHAT_INFO_PLIST)
     if pid is None:
-        return WeChatStatus(False, None, version, str(executable), "未检测到微信主进程")
-    return WeChatStatus(True, pid, version, str(executable), "已检测到微信主进程")
+        return WeChatStatus(False, None, version, str(target), "未检测到微信主进程")
+    return WeChatStatus(True, pid, version, str(target), "已检测到微信主进程")
 
 
-# 请求 macOS LaunchServices 启动微信客户端。
+# 请求启动本机微信客户端。
 def launch_wechat() -> tuple[bool, str]:
+    if sys.platform == "win32":
+        from windows_memory_probe import launch_windows_wechat
+
+        return launch_windows_wechat()
     try:
         completed = subprocess.run(["open", "-a", "WeChat"], capture_output=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
@@ -584,17 +793,18 @@ def launch_wechat() -> tuple[bool, str]:
 
 
 # 兼容调用方常用命名：获取微信主进程 PID。
-def get_wechat_pid(executable: Path | str = WECHAT_EXECUTABLE) -> int | None:
+def get_wechat_pid(executable: Path | str | None = None) -> int | None:
     return find_wechat_pid(executable)
 
 
 # 兼容调用方常用命名：读取微信短版本号。
-def get_wechat_version(info_plist: Path | str = WECHAT_INFO_PLIST) -> str | None:
+def get_wechat_version(info_plist: Path | str | None = None) -> str | None:
     return read_wechat_version(info_plist)
 
 
 __all__ = [
     "APP_SUPPORT_DIR",
+    "CaptureError",
     "CaptureResult",
     "DEFAULT_KEY_PATH",
     "DTraceError",
@@ -606,11 +816,14 @@ __all__ = [
     "WeChatStatus",
     "build_dtrace_program",
     "capture_keys",
+    "check_capture_probe",
     "check_dtrace_probe",
+    "default_app_support_dir",
     "default_key_path",
     "detect_wechat",
     "ensure_key_path_outside_export",
     "find_wechat_pid",
+    "get_capture_prerequisite",
     "get_wechat_pid",
     "get_sip_status",
     "get_wechat_version",

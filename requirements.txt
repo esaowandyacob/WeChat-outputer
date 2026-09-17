@@ -1,2 +1,8 @@
-# 读取微信 4.x WCDB 压缩正文；缺少时仍可读取未压缩文本。
+# 运行时依赖。macOS / Windows 用同一份文件：
+#   python -m pip install -r requirements.txt
+#
+# 需要 64 位 Python 3.10+。Tkinter 随官方 Python / conda 自带，不必另装。
+# sqlcipher3>=0.6.2 自带 Windows / macOS / Linux 预编译 wheel，无需 brew 或单独装 SQLCipher。
+
 zstandard>=0.23.0
+sqlcipher3>=0.6.2
