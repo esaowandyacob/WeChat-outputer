@@ -124,7 +124,11 @@ class MemoryScanStats:
     salt_utf16_hits: int = 0
     salt_binary_hits: int = 0
     data_dir_hits: int = 0
+    skipped_large_bytes: int = 0
     ascii_hex_lengths: dict[str, int] = None  # type: ignore[assignment]
+    skipped_large_examples: list[int] = None  # type: ignore[assignment]
+    salt_samples: list[tuple[str, str, str, str]] = None  # type: ignore[assignment]
+    x32_values: list[str] = None  # type: ignore[assignment]
     notes: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -132,6 +136,12 @@ class MemoryScanStats:
             self.notes = []
         if self.ascii_hex_lengths is None:
             self.ascii_hex_lengths = {}
+        if self.skipped_large_examples is None:
+            self.skipped_large_examples = []
+        if self.salt_samples is None:
+            self.salt_samples = []
+        if self.x32_values is None:
+            self.x32_values = []
 
 
 # 已知数据库 salt 若以十六进制出现在内存中，取其前面 64 个 hex 作为密钥文本。
@@ -228,6 +238,66 @@ def _hex_length_bucket(count: int) -> str:
     if count > 96:
         return ">96"
     return f"other:{count}"
+
+
+# 采集已知 salt 附近 32 字节，供后续 HMAC 检验。
+def collect_salt_hit_samples(
+    data: bytes,
+    salts: Mapping[str, bytes],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, str, str, str]]:
+    raw = bytes(data)
+    samples: list[tuple[str, str, str, str]] = []
+    for salt_hex, salt in salts.items():
+        if len(samples) >= limit:
+            break
+        start = 0
+        while len(samples) < limit:
+            index = raw.find(salt, start)
+            if index < 0:
+                break
+            before = raw[index - 32 : index].hex() if index >= 32 else ""
+            after = raw[index + len(salt) : index + len(salt) + 32].hex() if index + len(salt) + 32 <= len(raw) else ""
+            samples.append(("binary", salt_hex, before, after))
+            start = index + 1
+        needle = salt_hex.encode("ascii")
+        start = 0
+        while len(samples) < limit:
+            index = raw.find(needle, start)
+            if index < 0:
+                break
+            prefix = raw[max(0, index - 80) : index].hex()
+            before = raw[index - 32 : index].hex() if index >= 32 else ""
+            samples.append(("ascii", salt_hex, before, prefix))
+            start = index + 1
+    return samples
+
+
+# 收集 x' 后恰好 32 个 hex 的字面量（16 字节，可能是 salt 而不是 AES key）。
+def collect_x32_hex_values(data: bytes, *, limit: int = 8) -> list[str]:
+    raw = bytes(data)
+    hex_digits = b"0123456789abcdefABCDEF"
+    found: list[str] = []
+    start = 0
+    while len(found) < limit:
+        first = raw.find(b"x'", start)
+        second = raw.find(b"X'", start)
+        hits = [item for item in (first, second) if item >= 0]
+        if not hits:
+            break
+        index = min(hits)
+        position = index + 2
+        length = 0
+        while position < len(raw) and raw[position] in hex_digits:
+            length += 1
+            position += 1
+        if length == 32:
+            value = raw[index + 2 : index + 34].decode("ascii").lower()
+            if value not in found:
+                found.append(value)
+        start = index + 2
+    return found
 
 
 # 统计 ASCII x' 后紧跟的 hex 长度分布。
@@ -348,8 +418,18 @@ def format_memory_scan_report(stats: MemoryScanStats, extra_lines: Sequence[str]
                 or "无"
             ),
             f"xwechat_files 路径串：{stats.data_dir_hits}",
+            (
+                f"跳过过大区域合计 {stats.skipped_large_bytes} 字节，样例 "
+                + ",".join(str(item) for item in stats.skipped_large_examples[:8])
+            ),
         ]
     )
+    if stats.x32_values:
+        lines.append("x'后32hex：" + "、".join(stats.x32_values[:8]))
+    if stats.salt_samples:
+        lines.append("salt 邻域样例：")
+        for kind, salt_hex, before, after in stats.salt_samples[:8]:
+            lines.append(f"  {kind} salt={salt_hex} before32={before} after/prefix={after}")
     if stats.notes:
         lines.extend(stats.notes)
     if extra_lines:
@@ -856,6 +936,9 @@ def _for_each_memory_chunk(
                 continue
             if size > MAX_REGION_SIZE:
                 counters.regions_skipped_size += 1
+                counters.skipped_large_bytes += size
+                if len(counters.skipped_large_examples) < 12:
+                    counters.skipped_large_examples.append(size)
                 address = next_address
                 continue
             heap_ok = (not private_only) or region_type in HEAP_TYPES
@@ -961,6 +1044,13 @@ def scan_wechat_process_memory(
         stats.data_dir_hits += markers["data_dir_hits"]
         for name, count in markers["ascii_hex_lengths"].items():
             stats.ascii_hex_lengths[name] = stats.ascii_hex_lengths.get(name, 0) + count
+        if salts:
+            if len(stats.salt_samples) < 8:
+                stats.salt_samples.extend(collect_salt_hit_samples(chunk, salts, limit=8 - len(stats.salt_samples)))
+            if len(stats.x32_values) < 8:
+                for item in collect_x32_hex_values(chunk, limit=8 - len(stats.x32_values)):
+                    if item not in stats.x32_values:
+                        stats.x32_values.append(item)
         for candidate in extract_key_candidates_from_bytes(payload, salts):
             _remember_key_candidate(keys, by_key, candidate.key_hex, candidate.salt_hex)
         for item in extract_data_dirs_from_bytes(payload):

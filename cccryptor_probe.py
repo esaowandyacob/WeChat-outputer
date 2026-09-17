@@ -628,6 +628,45 @@ def _capture_keys_windows(
                 f"salt 二进制 {stats.salt_binary_hits}，x' 标记 {stats.ascii_x_markers}，"
                 f"x'后hex {stats.ascii_hex_lengths}"
             )
+            if stats.salt_samples or stats.x32_values:
+                from read_wechat_conversation import sqlcipher4_raw_key_matches
+
+                pages_by_salt: dict[str, bytes] = {}
+                for path in message_paths:
+                    salt = read_sqlcipher_salt(path)
+                    if salt is None:
+                        continue
+                    try:
+                        pages_by_salt[salt.hex()] = path.read_bytes()[:4096]
+                    except OSError:
+                        continue
+                for kind, salt_hex, before, after in stats.salt_samples:
+                    if kind != "binary":
+                        extra_lines.append(f"  ascii salt={salt_hex[:16]}… prefix80={after[:96]}")
+                        continue
+                    for label, blob in (("before32", before), ("after32", after)):
+                        if len(blob) != 64:
+                            extra_lines.append(f"  HMAC {kind} {label}：长度不是 32 字节")
+                            continue
+                        page = pages_by_salt.get(salt_hex)
+                        if page is None:
+                            extra_lines.append(f"  HMAC {kind} {label}：没有对应数据库页")
+                            continue
+                        matched = sqlcipher4_raw_key_matches(page, bytes.fromhex(blob))
+                        extra_lines.append(f"  HMAC {kind} salt={salt_hex[:16]}… {label}={matched}")
+                        if matched:
+                            _validate_and_store_candidate(
+                                blob,
+                                validator,
+                                key_path,
+                                on_candidate,
+                                on_status,
+                                seen,
+                                candidates,
+                                validated_records,
+                            )
+                for value in stats.x32_values:
+                    extra_lines.append(f"  x'32hex={value} 是否已知salt={value in salts}")
             if data_dirs:
                 extra_lines.append("  数据目录：" + "；".join(str(item) for item in data_dirs[:5]))
             process_reports.append(format_memory_scan_report(stats))
