@@ -140,6 +140,11 @@ class MemoryScanStats:
     salt_samples: list[tuple[str, str, str, str]] = None  # type: ignore[assignment]
     x32_values: list[str] = None  # type: ignore[assignment]
     pragma_samples: list[str] = None  # type: ignore[assignment]
+    salt_follow32: list[tuple[str, str]] = None  # type: ignore[assignment]
+    pragma_key_hits: int = 0
+    pragma_salt_hits: int = 0
+    pragma_page_hits: int = 0
+    sqlite3_key_hits: int = 0
     notes: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -155,6 +160,8 @@ class MemoryScanStats:
             self.x32_values = []
         if self.pragma_samples is None:
             self.pragma_samples = []
+        if self.salt_follow32 is None:
+            self.salt_follow32 = []
 
 
 # 已知数据库 salt 若以十六进制出现在内存中，取其前面 64 个 hex 作为密钥文本。
@@ -287,12 +294,57 @@ def collect_salt_hit_samples(
     return samples
 
 
-# 收集 SQLCipher/WCDB 相关明文字符串及其后 96 字节，供对照 pragma 用法。
+# 统计不会误伤 sqlite3_keyword 的精确子串次数。
+def count_token(data: bytes, token: bytes) -> int:
+    raw = bytes(data)
+    total = 0
+    start = 0
+    while True:
+        index = raw.find(token, start)
+        if index < 0:
+            return total
+        nxt = raw[index + len(token) : index + len(token) + 1]
+        if nxt and nxt in b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_":
+            start = index + 1
+            continue
+        total += 1
+        start = index + len(token)
+    return total
+
+
+# 已知 salt 的 ASCII hex 之后 32 字节，对应 pragma 语句后面可能跟上的 key。
+def collect_follow_bytes_after_salt_hex(
+    data: bytes,
+    salts: Mapping[str, bytes],
+    *,
+    limit: int = 8,
+) -> list[tuple[str, str]]:
+    raw = bytes(data)
+    found: list[tuple[str, str]] = []
+    for salt_hex in salts:
+        needle = salt_hex.encode("ascii")
+        start = 0
+        while len(found) < limit:
+            index = raw.find(needle, start)
+            if index < 0:
+                break
+            position = index + len(needle)
+            if position < len(raw) and raw[position : position + 1] in b"'\"":
+                position += 1
+            follow = raw[position : position + 32]
+            if len(follow) == 32:
+                found.append((salt_hex, follow.hex()))
+            start = index + 1
+    return found
+
+
+# 收集 SQLCipher/WCDB 相关明文字符串及其后 200 字节，供对照 pragma 用法。
 def collect_probe_string_hits(data: bytes, *, limit: int = 8) -> list[str]:
     raw = bytes(data)
     hits: list[str] = []
-    needles = list(PROBE_STRINGS)
-    needles.extend(item.decode("ascii").encode("utf-16le") for item in PROBE_STRINGS)
+    preferred = (b"PRAGMA key", b"PRAGMA cipher_salt", b"PRAGMA cipher_page_size", b"cipher_key", b"setCipherKey")
+    needles = list(preferred)
+    needles.extend(item.decode("ascii").encode("utf-16le") for item in preferred)
     for needle in needles:
         start = 0
         label = needle.decode("ascii", errors="replace").replace("\x00", "")
@@ -300,7 +352,7 @@ def collect_probe_string_hits(data: bytes, *, limit: int = 8) -> list[str]:
             index = raw.find(needle, start)
             if index < 0:
                 break
-            window = raw[index : index + 120]
+            window = raw[index : index + 200]
             printable = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in window)
             hits.append(f"{label}: {printable}")
             start = index + max(len(needle), 1)
@@ -451,6 +503,12 @@ def format_memory_scan_report(stats: MemoryScanStats, extra_lines: Sequence[str]
                 or "无"
             ),
             f"xwechat_files 路径串：{stats.data_dir_hits}",
+            (
+                f"精确计数：PRAGMA key={stats.pragma_key_hits}，"
+                f"cipher_salt={stats.pragma_salt_hits}，"
+                f"cipher_page_size={stats.pragma_page_hits}，"
+                f"sqlite3_key={stats.sqlite3_key_hits}"
+            ),
             (
                 f"跳过过大区域合计 {stats.skipped_large_bytes} 字节，样例 "
                 + ",".join(str(item) for item in stats.skipped_large_examples[:8])
@@ -1078,6 +1136,10 @@ def scan_wechat_process_memory(
         stats.salt_utf16_hits += markers["salt_utf16_hits"]
         stats.salt_binary_hits += markers["salt_binary_hits"]
         stats.data_dir_hits += markers["data_dir_hits"]
+        stats.pragma_key_hits += count_token(chunk, b"PRAGMA key")
+        stats.pragma_salt_hits += count_token(chunk, b"PRAGMA cipher_salt")
+        stats.pragma_page_hits += count_token(chunk, b"PRAGMA cipher_page_size")
+        stats.sqlite3_key_hits += count_token(chunk, b"sqlite3_key")
         for name, count in markers["ascii_hex_lengths"].items():
             stats.ascii_hex_lengths[name] = stats.ascii_hex_lengths.get(name, 0) + count
         if salts:
@@ -1087,6 +1149,10 @@ def scan_wechat_process_memory(
                 for item in collect_x32_hex_values(chunk, limit=8 - len(stats.x32_values)):
                     if item not in stats.x32_values:
                         stats.x32_values.append(item)
+            if len(stats.salt_follow32) < 8:
+                stats.salt_follow32.extend(
+                    collect_follow_bytes_after_salt_hex(chunk, salts, limit=8 - len(stats.salt_follow32))
+                )
         if len(stats.pragma_samples) < 8:
             stats.pragma_samples.extend(collect_probe_string_hits(chunk, limit=8 - len(stats.pragma_samples)))
         for candidate in extract_key_candidates_from_bytes(payload, salts):

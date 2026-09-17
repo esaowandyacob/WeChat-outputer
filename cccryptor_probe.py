@@ -667,6 +667,47 @@ def _capture_keys_windows(
                             )
                 for value in stats.x32_values:
                     extra_lines.append(f"  x'32hex={value} 是否已知salt={value in salts}")
+                    if value in salts:
+                        continue
+                    extra_lines.append("  未知 16 字节，按 passphrase 对每个库做 HMAC")
+                    import hashlib
+
+                    raw16 = bytes.fromhex(value)
+                    for salt_hex, page in pages_by_salt.items():
+                        salt = bytes.fromhex(salt_hex)
+                        derived = hashlib.pbkdf2_hmac("sha512", raw16, salt, 256000, dklen=32)
+                        matched = sqlcipher4_raw_key_matches(page, derived)
+                        extra_lines.append(f"    PBKDF2(raw16, {salt_hex[:8]}…) hmac={matched}")
+                        if matched:
+                            _validate_and_store_candidate(
+                                derived.hex(),
+                                validator,
+                                key_path,
+                                on_candidate,
+                                on_status,
+                                seen,
+                                candidates,
+                                validated_records,
+                            )
+                for salt_hex, follow in stats.salt_follow32:
+                    extra_lines.append(f"  salt hex后32字节 hmac salt={salt_hex[:16]}…")
+                    page = pages_by_salt.get(salt_hex)
+                    if page is None or len(follow) != 64:
+                        extra_lines.append("    跳过（没有页或长度不对）")
+                        continue
+                    matched = sqlcipher4_raw_key_matches(page, bytes.fromhex(follow))
+                    extra_lines.append(f"    follow32 hmac={matched}")
+                    if matched:
+                        _validate_and_store_candidate(
+                            follow,
+                            validator,
+                            key_path,
+                            on_candidate,
+                            on_status,
+                            seen,
+                            candidates,
+                            validated_records,
+                        )
             if data_dirs:
                 extra_lines.append("  数据目录：" + "；".join(str(item) for item in data_dirs[:5]))
             process_reports.append(format_memory_scan_report(stats))
