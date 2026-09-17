@@ -43,7 +43,17 @@ READABLE_PROTECT = {0x02, 0x04, 0x08, 0x20, 0x40, 0x80}
 HEAP_TYPES = {MEM_PRIVATE, MEM_MAPPED}
 CHUNK_SIZE = 4 * 1024 * 1024
 CHUNK_OVERLAP = 512
-MAX_REGION_SIZE = 1024 * 1024 * 1024
+MAX_REGION_SIZE = 4 * 1024 * 1024 * 1024
+BOGUS_REGION_SIZE = 8 * 1024 * 1024 * 1024
+PROBE_STRINGS = (
+    b"PRAGMA key",
+    b"PRAGMA cipher",
+    b"cipher_key",
+    b"cipher_salt",
+    b"sqlite3_key",
+    b"setCipherKey",
+    b"CipherKey",
+)
 
 
 class WindowsProbeError(RuntimeError):
@@ -129,6 +139,7 @@ class MemoryScanStats:
     skipped_large_examples: list[int] = None  # type: ignore[assignment]
     salt_samples: list[tuple[str, str, str, str]] = None  # type: ignore[assignment]
     x32_values: list[str] = None  # type: ignore[assignment]
+    pragma_samples: list[str] = None  # type: ignore[assignment]
     notes: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -142,6 +153,8 @@ class MemoryScanStats:
             self.salt_samples = []
         if self.x32_values is None:
             self.x32_values = []
+        if self.pragma_samples is None:
+            self.pragma_samples = []
 
 
 # 已知数据库 salt 若以十六进制出现在内存中，取其前面 64 个 hex 作为密钥文本。
@@ -272,6 +285,26 @@ def collect_salt_hit_samples(
             samples.append(("ascii", salt_hex, before, prefix))
             start = index + 1
     return samples
+
+
+# 收集 SQLCipher/WCDB 相关明文字符串及其后 96 字节，供对照 pragma 用法。
+def collect_probe_string_hits(data: bytes, *, limit: int = 8) -> list[str]:
+    raw = bytes(data)
+    hits: list[str] = []
+    needles = list(PROBE_STRINGS)
+    needles.extend(item.decode("ascii").encode("utf-16le") for item in PROBE_STRINGS)
+    for needle in needles:
+        start = 0
+        label = needle.decode("ascii", errors="replace").replace("\x00", "")
+        while len(hits) < limit:
+            index = raw.find(needle, start)
+            if index < 0:
+                break
+            window = raw[index : index + 120]
+            printable = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in window)
+            hits.append(f"{label}: {printable}")
+            start = index + max(len(needle), 1)
+    return hits
 
 
 # 收集 x' 后恰好 32 个 hex 的字面量（16 字节，可能是 salt 而不是 AES key）。
@@ -430,6 +463,9 @@ def format_memory_scan_report(stats: MemoryScanStats, extra_lines: Sequence[str]
         lines.append("salt 邻域样例：")
         for kind, salt_hex, before, after in stats.salt_samples[:8]:
             lines.append(f"  {kind} salt={salt_hex} before32={before} after/prefix={after}")
+    if stats.pragma_samples:
+        lines.append("SQLCipher 字符串：")
+        lines.extend(f"  {item}" for item in stats.pragma_samples[:8])
     if stats.notes:
         lines.extend(stats.notes)
     if extra_lines:
@@ -934,7 +970,7 @@ def _for_each_memory_chunk(
                 counters.regions_skipped_guard += 1
                 address = next_address
                 continue
-            if size > MAX_REGION_SIZE:
+            if size > BOGUS_REGION_SIZE:
                 counters.regions_skipped_size += 1
                 counters.skipped_large_bytes += size
                 if len(counters.skipped_large_examples) < 12:
@@ -1051,6 +1087,8 @@ def scan_wechat_process_memory(
                 for item in collect_x32_hex_values(chunk, limit=8 - len(stats.x32_values)):
                     if item not in stats.x32_values:
                         stats.x32_values.append(item)
+        if len(stats.pragma_samples) < 8:
+            stats.pragma_samples.extend(collect_probe_string_hits(chunk, limit=8 - len(stats.pragma_samples)))
         for candidate in extract_key_candidates_from_bytes(payload, salts):
             _remember_key_candidate(keys, by_key, candidate.key_hex, candidate.salt_hex)
         for item in extract_data_dirs_from_bytes(payload):

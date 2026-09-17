@@ -40,6 +40,7 @@ from read_wechat_conversation import (
 from windows_memory_probe import (
     MemoryScanStats,
     ascii_x_hex_length_histogram,
+    collect_probe_string_hits,
     collect_salt_hit_samples,
     collect_x32_hex_values,
     extract_data_dirs_from_bytes,
@@ -287,6 +288,8 @@ def test_extract_hex_keys_from_memory_bytes() -> None:
     assert samples[0][2] == (b"\x11" * 32).hex()
     assert samples[0][3] == (b"\x22" * 32).hex()
     assert collect_x32_hex_values(b"x'" + (b"ab" * 16) + b"zz") == ["ab" * 16]
+    pragma_hits = collect_probe_string_hits(b"xxPRAGMA cipher_salt = x'aabb'yy")
+    assert any("PRAGMA cipher" in item and "cipher_salt" in item for item in pragma_hits)
 
 
 # 验证探针报告包含可观察计数，不包含完整密钥。
