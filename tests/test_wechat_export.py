@@ -29,15 +29,18 @@ from read_wechat_conversation import (
     build_memory_model,
     decode_message_content,
     default_wechat_data_roots,
+    detect_sqlcipher_key_mode,
     discover_message_databases,
     export_html,
     export_sqlite,
     export_text,
     find_sqlcipher_driver,
+    open_database_backend,
 )
 from windows_memory_probe import (
     extract_data_dirs_from_bytes,
     extract_hex_keys_from_bytes,
+    extract_key_candidates_from_bytes,
     normalize_windows_data_root,
 )
 
@@ -121,6 +124,32 @@ def test_key_store_is_private(tmp_path: Path) -> None:
 # 验证运行时已安装可用的 SQLCipher Python 驱动。
 def test_sqlcipher_python_driver_is_available() -> None:
     assert find_sqlcipher_driver() is not None
+
+
+# 验证 raw key 能通过 HMAC 并打开 SQLCipher 4 加密库。
+def test_sqlcipher_raw_key_roundtrip(tmp_path: Path) -> None:
+    driver = find_sqlcipher_driver()
+    if driver is None:
+        pytest.skip("未安装 sqlcipher3")
+    key = "11" * 32
+    path = tmp_path / "message_0.db"
+    connection = driver.connect(str(path))
+    connection.execute("PRAGMA cipher_compatibility = 4")
+    connection.execute(f'PRAGMA key = "x\'{key}\'"')
+    connection.execute('CREATE TABLE "Msg_abc"(local_id INTEGER, message_content TEXT)')
+    connection.execute('INSERT INTO "Msg_abc" VALUES (1, "hello")')
+    connection.commit()
+    connection.close()
+    assert detect_sqlcipher_key_mode(path, key) == "raw"
+    backend = open_database_backend(path, key)
+    try:
+        assert backend.validate()
+        names = [row["name"] for row in backend.query("SELECT name FROM sqlite_master WHERE type='table'")]
+        assert "Msg_abc" in names
+    finally:
+        backend.close()
+    reader = WeChatReader(message_paths=[path], key_path=tmp_path / "keys.json")
+    assert reader.validate_key(key) == ("message_0.db",)
 
 
 # 验证 DTrace 脚本固定输出 32 个字节且包含精确过滤条件。
@@ -223,12 +252,18 @@ def test_default_key_path_is_platform_specific(tmp_path: Path) -> None:
 # 验证 Windows 内存中的 ASCII / UTF-16 密钥文本都能提取为 32 字节 hex。
 def test_extract_hex_keys_from_memory_bytes() -> None:
     key = "ab" * 32
+    salt = "cd" * 16
     ascii_blob = b"noise x'" + key.encode("ascii") + b"' more"
     assert extract_hex_keys_from_bytes(ascii_blob) == [key]
-    with_salt = b"x'" + key.encode("ascii") + (b"cd" * 16) + b"'"
+    with_salt = b"x'" + key.encode("ascii") + salt.encode("ascii") + b"'"
     assert extract_hex_keys_from_bytes(with_salt) == [key]
-    utf16_blob = ("prefix x'" + key + "' suffix").encode("utf-16le")
-    assert extract_hex_keys_from_bytes(utf16_blob) == [key]
+    candidates = extract_key_candidates_from_bytes(with_salt)
+    assert candidates[0].key_hex == key
+    assert candidates[0].salt_hex == salt
+    utf16_blob = ("prefix x'" + key + salt + "' suffix").encode("utf-16le")
+    utf16_candidates = extract_key_candidates_from_bytes(utf16_blob)
+    assert utf16_candidates[0].key_hex == key
+    assert utf16_candidates[0].salt_hex == salt
 
 
 # 验证 Windows 内存中的 xwechat_files 路径提取。

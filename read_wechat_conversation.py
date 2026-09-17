@@ -15,6 +15,7 @@ import base64
 import contextlib
 import datetime as _dt
 import hashlib
+import hmac
 import html
 import importlib
 import json
@@ -55,6 +56,9 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SILK_MAGIC = b"#!SILK_V3"
 WECHAT_SILK_MAGIC = b"\x02#!SILK_V3"
 PLAYABLE_AUDIO_MIMES = frozenset({"audio/wav", "audio/x-wav", "audio/mpeg", "audio/ogg", "audio/mp4", "audio/webm"})
+SQLCIPHER_PAGE_SIZE = 4096
+SQLCIPHER_HMAC_SIZE = 64
+SQLCIPHER_SALT_SIZE = 16
 
 
 class ReaderError(RuntimeError):
@@ -220,6 +224,88 @@ class SQLiteBackend:
             self.connection.close()
 
 
+# 生成 SQLCipher 4 解锁语句，优先 raw key，必要时再试 passphrase。
+def sqlcipher_key_recipes(key_hex: str, *, mode: str | None = None) -> list[tuple[str, ...]]:
+    normalized = normalize_key_hex(key_hex)
+    raw = (
+        "PRAGMA cipher_compatibility = 4",
+        f'PRAGMA key = "x\'{normalized}\'"',
+        "PRAGMA query_only = ON",
+    )
+    raw_legacy = (
+        f'PRAGMA key = "x\'{normalized}\'"',
+        "PRAGMA cipher_compatibility = 4",
+        "PRAGMA query_only = ON",
+    )
+    passphrase = (
+        "PRAGMA cipher_compatibility = 4",
+        f"PRAGMA key = '{normalized}'",
+        "PRAGMA query_only = ON",
+    )
+    if mode == "passphrase":
+        return [passphrase, raw, raw_legacy]
+    if mode == "raw":
+        return [raw, raw_legacy]
+    return [raw, raw_legacy, passphrase]
+
+
+# 读取加密库第一页的 16 字节 salt；明文库返回 None。
+def read_sqlcipher_salt(path: Path | str) -> bytes | None:
+    db_path = Path(path)
+    try:
+        with db_path.open("rb") as handle:
+            header = handle.read(SQLCIPHER_SALT_SIZE)
+    except OSError:
+        return None
+    if len(header) < SQLCIPHER_SALT_SIZE or header.startswith(b"SQLite format 3"):
+        return None
+    return header
+
+
+# 用 SQLCipher 4 的 page-1 HMAC 判断 32 字节 raw key 是否匹配。
+def sqlcipher4_raw_key_matches(page: bytes, enc_key: bytes) -> bool:
+    if len(page) < SQLCIPHER_PAGE_SIZE or len(enc_key) != 32:
+        return False
+    salt = page[:SQLCIPHER_SALT_SIZE]
+    mac_salt = bytes(byte ^ 0x3A for byte in salt)
+    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=32)
+    stored = page[-SQLCIPHER_HMAC_SIZE:]
+    payload = page[SQLCIPHER_SALT_SIZE : SQLCIPHER_PAGE_SIZE - SQLCIPHER_HMAC_SIZE] + (1).to_bytes(4, "little")
+    computed = hmac.new(mac_key, payload, hashlib.sha512).digest()
+    return hmac.compare_digest(stored, computed)
+
+
+# 判断候选是 raw key、passphrase，还是与该数据库不匹配。
+def detect_sqlcipher_key_mode(path: Path | str, key_hex: str, *, try_passphrase: bool = False) -> str | None:
+    db_path = Path(path)
+    try:
+        page = db_path.read_bytes()[:SQLCIPHER_PAGE_SIZE]
+    except OSError:
+        return None
+    if len(page) < SQLCIPHER_SALT_SIZE:
+        return None
+    if page.startswith(b"SQLite format 3"):
+        return "plaintext"
+    if len(page) < SQLCIPHER_PAGE_SIZE:
+        return None
+    try:
+        normalized = normalize_key_hex(key_hex)
+        raw_key = bytes.fromhex(normalized)
+    except Exception:
+        return None
+    if sqlcipher4_raw_key_matches(page, raw_key):
+        return "raw"
+    if not try_passphrase:
+        return None
+    derived = hashlib.pbkdf2_hmac("sha512", raw_key, page[:SQLCIPHER_SALT_SIZE], 256000, dklen=32)
+    if sqlcipher4_raw_key_matches(page, derived):
+        return "passphrase"
+    derived_text = hashlib.pbkdf2_hmac("sha512", normalized.encode("ascii"), page[:SQLCIPHER_SALT_SIZE], 256000, dklen=32)
+    if sqlcipher4_raw_key_matches(page, derived_text):
+        return "passphrase"
+    return None
+
+
 # 在 SQLCipher Python 驱动可用时执行查询，避免每条消息启动 CLI。
 class PythonSQLCipherBackend:
     """兼容 sqlcipher3 与 pysqlcipher3 的 Python 后端。"""
@@ -228,17 +314,28 @@ class PythonSQLCipherBackend:
     def __init__(self, path: Path | str, key_hex: str, driver: Any) -> None:
         self.path = Path(path)
         self.key_hex = normalize_key_hex(key_hex)
-        try:
+        mode = detect_sqlcipher_key_mode(self.path, self.key_hex)
+        last_error: Exception | None = None
+        for statements in sqlcipher_key_recipes(self.key_hex, mode=mode):
+            connection = None
             try:
-                self.connection = driver.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)
-            except (TypeError, ValueError):
-                # 旧版 SQLCipher 驱动不接受 URI 参数，仍在临时副本上打开。
-                self.connection = driver.connect(str(self.path))
-            self.connection.execute(f'PRAGMA key = "x\'{self.key_hex}\'"')
-            self.connection.execute("PRAGMA cipher_compatibility = 4")
-            self.connection.execute("PRAGMA query_only = ON")
-        except Exception:
-            raise DatabaseQueryError("SQLCipher 无法打开数据库副本") from None
+                # Windows 上 file:C:\... URI 会打开错误路径，导致所有候选都验证失败。
+                connection = driver.connect(str(self.path))
+                for statement in statements:
+                    connection.execute(statement)
+                probe = connection.execute("SELECT count(*) FROM sqlite_master").fetchall()
+                tables = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                if probe and tables:
+                    self.connection = connection
+                    return
+            except Exception as exc:
+                last_error = exc
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    connection.close()
+        raise DatabaseQueryError("SQLCipher 无法打开数据库副本") from last_error
 
     # 执行查询并把行转换为字典，不把 key 放入异常文本。
     def query(self, sql: str) -> list[dict[str, Any]]:
@@ -283,13 +380,13 @@ class SQLCipherCLIBackend:
         query = sql.strip().rstrip(";")
         if not query:
             return []
+        mode = detect_sqlcipher_key_mode(self.path, self.key_hex)
+        pragmas = "\n".join(f"{item};" for item in sqlcipher_key_recipes(self.key_hex, mode=mode)[0])
         script = (
             ".bail on\n"
             ".mode json\n"
             ".headers on\n"
-            f'PRAGMA key = "x\'{self.key_hex}\'";\n'
-            "PRAGMA cipher_compatibility = 4;\n"
-            "PRAGMA query_only = ON;\n"
+            f"{pragmas}\n"
             f"{query};\n"
             ".quit\n"
         ).encode("utf-8")
@@ -1607,8 +1704,10 @@ class WeChatReader:
         valid: list[str] = []
         if not message_paths:
             return tuple()
-        with database_snapshot(message_paths) as snapshots:
-            for source in message_paths:
+        preferred = [path for path in message_paths if detect_sqlcipher_key_mode(path, normalized) in {"plaintext", "raw", "passphrase"}]
+        targets = preferred or message_paths
+        with database_snapshot(targets) as snapshots:
+            for source in targets:
                 copy_path = snapshots[source]
                 database: DatabaseBackend | None = None
                 try:
@@ -2798,6 +2897,7 @@ __all__ = [
     "database_snapshot",
     "decode_message_content",
     "default_wechat_data_roots",
+    "detect_sqlcipher_key_mode",
     "decode_silk_to_wav",
     "deduplicate_messages",
     "discover_message_databases",
@@ -2836,6 +2936,8 @@ __all__ = [
     "safe_link_url",
     "scan_message_databases",
     "sql_identifier",
+    "sqlcipher4_raw_key_matches",
+    "sqlcipher_key_recipes",
     "sql_literal",
     "table_columns",
     "table_names",

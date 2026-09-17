@@ -498,6 +498,26 @@ def _validate_and_store_candidate(
     _notify(on_status, f"候选密钥 {masked} 已验证并保存")
 
 
+# 若验证器绑定了 WeChatReader，则用内存里发现的数据目录补全扫描根。
+def _attach_discovered_data_roots(validator: Callable[..., object], data_dirs: Iterable[Path]) -> None:
+    reader = getattr(validator, "__self__", None)
+    if reader is None or not data_dirs:
+        return
+    current = getattr(reader, "data_root", None)
+    if current is not None:
+        return
+    from read_wechat_conversation import discover_message_databases
+
+    for root in data_dirs:
+        try:
+            if discover_message_databases(root):
+                reader.data_root = root
+                return
+        except Exception:
+            continue
+    reader.data_root = next(iter(data_dirs))
+
+
 # 只读扫描 Windows 微信进程内存中的 WCDB 密钥文本。
 def _capture_keys_windows(
     pid: int,
@@ -510,7 +530,7 @@ def _capture_keys_windows(
     on_status: Callable[[str], object] | None = None,
     stop_event: object | None = None,
 ) -> CaptureResult:
-    from windows_memory_probe import WindowsProbeError, scan_process_memory_keys
+    from windows_memory_probe import WindowsProbeError, scan_wechat_process_memory
 
     started = time.monotonic()
     candidates: list[str] = []
@@ -518,6 +538,8 @@ def _capture_keys_windows(
     validated_records: list[KeyRecord] = []
     error: str | None = None
     try:
+        from read_wechat_conversation import discover_message_databases, find_sqlcipher_driver, find_sqlcipher_executable
+
         deadline = started + max(0, int(duration))
         _notify(on_status, "正在扫描微信进程内存")
         while time.monotonic() <= deadline:
@@ -525,8 +547,12 @@ def _capture_keys_windows(
                 break
             remaining = max(0, int(deadline - time.monotonic() + 0.999))
             _notify(on_tick, remaining)
-            keys = scan_process_memory_keys(int(pid), on_status=on_status, stop_event=stop_event)
-            for candidate in keys:
+            memory_keys, data_dirs = scan_wechat_process_memory(int(pid), on_status=on_status, stop_event=stop_event)
+            _attach_discovered_data_roots(validator, data_dirs)
+            ordered = [item.key_hex for item in memory_keys if item.salt_hex] + [
+                item.key_hex for item in memory_keys if not item.salt_hex
+            ]
+            for candidate in ordered:
                 _validate_and_store_candidate(
                     candidate,
                     validator,
@@ -544,6 +570,20 @@ def _capture_keys_windows(
                 break
             _notify(on_status, "尚未验证成功，等待微信加载数据库后重试")
             time.sleep(min(3.0, remaining_wait))
+        if not validated_records and error is None:
+            has_driver = find_sqlcipher_driver() is not None or find_sqlcipher_executable() is not None
+            has_db = bool(discover_message_databases(getattr(getattr(validator, "__self__", None), "data_root", None)))
+            if not has_driver:
+                error = "未找到 SQLCipher，请先执行 python -m pip install -r requirements.txt"
+            elif not candidates:
+                error = "内存中未找到密钥。请确认已登录微信 4.x，打开几个会话后以管理员身份重试"
+            elif not has_db:
+                error = "已找到候选密钥，但未找到 message_N.db。请在第一步选择微信数据目录"
+            else:
+                error = (
+                    f"已扫描到 {len(candidates)} 个候选密钥，但无法打开数据库。"
+                    "请重新登录微信后再采集，并确认安装了 sqlcipher3"
+                )
     except WindowsProbeError as exc:
         error = redact_output(str(exc))
     except (OSError, KeyStoreError) as exc:
