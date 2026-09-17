@@ -572,11 +572,13 @@ class WeChatExportApp(tk.Tk):
             capture_button.set_enabled(True)
         self._reload_keys()
         if result.error:
-            self.capture_var.set(f"❌ 密钥采集失败：{result.error}")
+            self.capture_var.set(f"❌ {result.error}")
         elif result.validated_keys:
             self.capture_var.set(f"✅ 密钥采集完成（验证成功 {len(result.validated_keys)} 个）")
         else:
             self.capture_var.set("❌ 密钥采集完成，但没有候选通过验证")
+        if result.report:
+            self.captured_list_var.set(result.report)
 
     # 进入会话选择页并在后台读取会话列表。
     def _enter_conversations(self) -> None:

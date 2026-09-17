@@ -10,10 +10,11 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping, Sequence
 
 
 WECHAT_PROCESS_NAMES = ("Weixin.exe", "WeChat.exe")
@@ -35,11 +36,13 @@ PROCESS_VM_READ = 0x0010
 TH32CS_SNAPPROCESS = 0x00000002
 MEM_COMMIT = 0x1000
 MEM_PRIVATE = 0x20000
+MEM_MAPPED = 0x40000
 PAGE_GUARD = 0x100
 READABLE_PROTECT = {0x02, 0x04, 0x08, 0x20, 0x40, 0x80}
+HEAP_TYPES = {MEM_PRIVATE, MEM_MAPPED}
 CHUNK_SIZE = 4 * 1024 * 1024
-CHUNK_OVERLAP = 256
-MAX_REGION_SIZE = 256 * 1024 * 1024
+CHUNK_OVERLAP = 512
+MAX_REGION_SIZE = 1024 * 1024 * 1024
 
 
 class WindowsProbeError(RuntimeError):
@@ -88,8 +91,94 @@ def _remember_key_candidate(
         found[index] = MemoryKeyCandidate(key, salt)
 
 
+@dataclass
+class MemoryScanStats:
+    """一次内存探针的可观察计数，供界面和日志展示。"""
+
+    python_bits: int = 0
+    admin: bool | None = None
+    pid: int = 0
+    process_name: str = ""
+    version: str | None = None
+    working_set: int = 0
+    mbi_size: int = 0
+    open_error: int | None = None
+    query_error: int | None = None
+    regions_seen: int = 0
+    regions_committed: int = 0
+    regions_private: int = 0
+    regions_mapped: int = 0
+    regions_readable: int = 0
+    regions_skipped_guard: int = 0
+    regions_skipped_size: int = 0
+    read_ok: int = 0
+    read_fail: int = 0
+    read_fail_error: int | None = None
+    bytes_read: int = 0
+    ascii_x_markers: int = 0
+    utf16_x_markers: int = 0
+    ascii_key_hits: int = 0
+    utf16_key_hits: int = 0
+    salt_ascii_hits: int = 0
+    salt_utf16_hits: int = 0
+    salt_binary_hits: int = 0
+    data_dir_hits: int = 0
+    notes: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.notes is None:
+            self.notes = []
+
+
+# 已知数据库 salt 若以十六进制出现在内存中，取其前面 64 个 hex 作为密钥文本。
+def extract_keys_using_salts(
+    data: bytes | bytearray | memoryview,
+    salts: Mapping[str, bytes],
+    found: list[MemoryKeyCandidate] | None = None,
+    by_key: dict[str, int] | None = None,
+) -> list[MemoryKeyCandidate]:
+    raw = bytes(data)
+    result = found if found is not None else []
+    index = by_key if by_key is not None else {}
+    for salt_hex in salts:
+        salt_hex = salt_hex.lower()
+        ascii_salt = salt_hex.encode("ascii")
+        start = 0
+        while True:
+            position = raw.find(ascii_salt, start)
+            if position < 0:
+                break
+            if position >= 64:
+                prefix = raw[position - 64 : position]
+                if HEX_KEY_RE.fullmatch(prefix.decode("ascii", errors="ignore")):
+                    _remember_key_candidate(result, index, prefix.decode("ascii"), salt_hex)
+            start = position + 1
+        utf16_salt = salt_hex.encode("utf-16le")
+        start = 0
+        while True:
+            position = raw.find(utf16_salt, start)
+            if position < 0:
+                break
+            if position >= 128:
+                prefix = raw[position - 128 : position]
+                chars: list[str] = []
+                valid = True
+                for offset in range(0, 128, 2):
+                    if prefix[offset + 1] != 0 or chr(prefix[offset]) not in "0123456789abcdefABCDEF":
+                        valid = False
+                        break
+                    chars.append(chr(prefix[offset]))
+                if valid:
+                    _remember_key_candidate(result, index, "".join(chars), salt_hex)
+            start = position + 1
+    return result
+
+
 # 从一段内存中提取 WCDB ``x'<key><salt>'`` 候选。
-def extract_key_candidates_from_bytes(data: bytes | bytearray | memoryview) -> list[MemoryKeyCandidate]:
+def extract_key_candidates_from_bytes(
+    data: bytes | bytearray | memoryview,
+    salts: Mapping[str, bytes] | None = None,
+) -> list[MemoryKeyCandidate]:
     raw = bytes(data)
     found: list[MemoryKeyCandidate] = []
     by_key: dict[str, int] = {}
@@ -114,12 +203,103 @@ def extract_key_candidates_from_bytes(data: bytes | bytearray | memoryview) -> l
                 salt = "".join(hex_chars[64:96]) if len(hex_chars) >= 96 else None
                 _remember_key_candidate(found, by_key, "".join(hex_chars[:64]), salt)
             start = index + 2
+    if salts:
+        extract_keys_using_salts(raw, salts, found, by_key)
     return found
 
 
 # 从一段内存中提取 32 字节 AES 密钥的十六进制文本。
 def extract_hex_keys_from_bytes(data: bytes | bytearray | memoryview) -> list[str]:
     return [item.key_hex for item in extract_key_candidates_from_bytes(data)]
+
+
+# 统计当前内存块里可观察的标记次数，避免和重叠窗口重复计算。
+def count_probe_markers(data: bytes, salts: Mapping[str, bytes] | None = None) -> dict[str, int]:
+    raw = bytes(data)
+    ascii_keys = 0
+    utf16_keys = 0
+    for match in ASCII_KEY_RE.finditer(raw):
+        ascii_keys += 1
+    for marker in (b"x\x00'\x00", b"X\x00'\x00"):
+        start = 0
+        while True:
+            index = raw.find(marker, start)
+            if index < 0:
+                break
+            utf16_keys += 1
+            start = index + 2
+    salt_ascii = salt_utf16 = salt_binary = 0
+    if salts:
+        for salt_hex, salt in salts.items():
+            salt_ascii += raw.count(salt_hex.encode("ascii"))
+            salt_utf16 += raw.count(salt_hex.encode("utf-16le"))
+            salt_binary += raw.count(salt)
+    return {
+        "ascii_x_markers": raw.count(b"x'") + raw.count(b"X'"),
+        "utf16_x_markers": raw.count(b"x\x00'\x00") + raw.count(b"X\x00'\x00"),
+        "ascii_key_hits": ascii_keys,
+        "utf16_key_hits": utf16_keys,
+        "salt_ascii_hits": salt_ascii,
+        "salt_utf16_hits": salt_utf16,
+        "salt_binary_hits": salt_binary,
+        "data_dir_hits": len(extract_data_dirs_from_bytes(raw)),
+    }
+
+
+# 把探针计数格式化成可复制的中文报告。
+def format_memory_scan_report(stats: MemoryScanStats, extra_lines: Sequence[str] | None = None) -> str:
+    def size_text(value: int) -> str:
+        if value >= 1024 * 1024:
+            return f"{value / (1024 * 1024):.1f} MB"
+        if value >= 1024:
+            return f"{value / 1024:.1f} KB"
+        return f"{value} B"
+
+    admin = "是" if stats.admin is True else "否" if stats.admin is False else "未知"
+    lines = [
+        "=== Windows 密钥采集探针 ===",
+        f"Python：{stats.python_bits} 位",
+        f"管理员：{admin}",
+        f"进程：PID {stats.pid} {stats.process_name or '?'} 版本 {stats.version or '未知'} 工作集 {size_text(stats.working_set)}",
+        f"MEMORY_BASIC_INFORMATION 大小：{stats.mbi_size}（64 位 Windows 期望 48）",
+    ]
+    if stats.open_error:
+        lines.append(f"OpenProcess 失败：GetLastError={stats.open_error}")
+    if stats.query_error:
+        lines.append(f"VirtualQueryEx 首次失败：GetLastError={stats.query_error}")
+    lines.extend(
+        [
+            (
+                "内存区域：看到 {seen}，提交 {committed}，私有 {private}，映射 {mapped}，可读 {readable}"
+            ).format(
+                seen=stats.regions_seen,
+                committed=stats.regions_committed,
+                private=stats.regions_private,
+                mapped=stats.regions_mapped,
+                readable=stats.regions_readable,
+            ),
+            f"跳过：GUARD {stats.regions_skipped_guard}，过大 {stats.regions_skipped_size}",
+            (
+                f"ReadProcessMemory：成功 {stats.read_ok} 块，失败 {stats.read_fail} 块，"
+                f"读到 {size_text(stats.bytes_read)}"
+                + (f"，失败码 {stats.read_fail_error}" if stats.read_fail_error else "")
+            ),
+            (
+                f"模式计数：ASCII x' 标记 {stats.ascii_x_markers}（完整密钥串 {stats.ascii_key_hits}），"
+                f"UTF-16 x' 标记 {stats.utf16_x_markers}（完整密钥串 {stats.utf16_key_hits}）"
+            ),
+            (
+                f"已知库 salt：ASCII {stats.salt_ascii_hits}，UTF-16 {stats.salt_utf16_hits}，"
+                f"二进制 {stats.salt_binary_hits}"
+            ),
+            f"xwechat_files 路径串：{stats.data_dir_hits}",
+        ]
+    )
+    if stats.notes:
+        lines.extend(stats.notes)
+    if extra_lines:
+        lines.extend(extra_lines)
+    return "\n".join(lines)
 
 
 # 从一段内存中提取 xwechat_files 数据目录路径。
@@ -307,11 +487,33 @@ def windows_wechat_executable_candidates() -> list[Path]:
     return found
 
 
-# 仅在 Windows 上加载 kernel32。
+# 仅在 Windows 上加载 kernel32，并固定 64 位指针参数，避免静默截断。
 def _kernel32() -> ctypes.WinDLL:
     if sys.platform != "win32":
         raise WindowsProbeError("仅 Windows 支持进程内存读取")
-    return ctypes.WinDLL("kernel32", use_last_error=True)
+    library = ctypes.WinDLL("kernel32", use_last_error=True)
+    library.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    library.OpenProcess.restype = ctypes.c_void_p
+    library.CloseHandle.argtypes = [ctypes.c_void_p]
+    library.CloseHandle.restype = ctypes.c_int
+    library.VirtualQueryEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    library.VirtualQueryEx.restype = ctypes.c_size_t
+    library.ReadProcessMemory.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    library.ReadProcessMemory.restype = ctypes.c_int
+    library.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    library.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    return library
+
+
+# 当前解释器是否为 64 位。
+def python_pointer_bits() -> int:
+    return struct.calcsize("P") * 8
 
 
 class _PROCESSENTRY32W(ctypes.Structure):
@@ -515,6 +717,9 @@ def find_windows_wechat_version() -> str | None:
 def check_process_memory_access(pid: int) -> tuple[bool, str]:
     if sys.platform != "win32":
         return False, "当前系统不是 Windows"
+    bits = python_pointer_bits()
+    if bits < 64:
+        return False, f"当前 Python 是 {bits} 位，无法读取 64 位微信，请改用 64 位 Python"
     handle = _open_process(int(pid), PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
     if handle is None:
         error = ctypes.get_last_error()
@@ -532,25 +737,28 @@ def _is_readable_protect(protect: int) -> bool:
     return (protect & 0xFF) in READABLE_PROTECT
 
 
-# 对进程可读内存逐块回调，供密钥和路径扫描复用。
+# 对进程可读内存逐块回调，并填写探针计数。
 def _for_each_memory_chunk(
     pid: int,
-    callback: Callable[[bytes], object],
+    callback: Callable[[bytes, bytes], object],
     *,
     private_only: bool,
     stop_event: object | None = None,
-) -> None:
+    stats: MemoryScanStats | None = None,
+) -> MemoryScanStats:
+    counters = stats or MemoryScanStats(pid=int(pid), python_bits=python_pointer_bits())
+    counters.mbi_size = ctypes.sizeof(_MEMORY_BASIC_INFORMATION)
     handle = _open_process(int(pid), PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
     if handle is None:
         error = ctypes.get_last_error()
+        counters.open_error = error
         if error == 5:
-            raise WindowsProbeError("无法读取微信进程内存，请以管理员身份运行本工具")
-        raise WindowsProbeError("无法打开微信进程")
+            raise WindowsProbeError(f"无法读取微信进程内存，OpenProcess GetLastError=5，请以管理员身份运行。探针：{format_memory_scan_report(counters)}")
+        raise WindowsProbeError(f"无法打开微信进程，OpenProcess GetLastError={error}")
     kernel32 = _kernel32()
-    kernel32.VirtualQueryEx.restype = ctypes.c_size_t
-    kernel32.ReadProcessMemory.restype = ctypes.c_int
     address = 0
     max_address = (1 << 48) - 1
+    first_query = True
     try:
         while address < max_address:
             if getattr(stop_event, "is_set", lambda: False)():
@@ -563,20 +771,38 @@ def _for_each_memory_chunk(
                 ctypes.sizeof(info),
             )
             if not result:
+                if first_query:
+                    counters.query_error = ctypes.get_last_error()
                 break
+            first_query = False
+            counters.regions_seen += 1
             base = int(info.BaseAddress or 0)
             size = int(info.RegionSize or 0)
+            protect = int(info.Protect or 0)
+            region_type = int(info.Type or 0)
+            state = int(info.State or 0)
+            if state == MEM_COMMIT:
+                counters.regions_committed += 1
+            if region_type == MEM_PRIVATE:
+                counters.regions_private += 1
+            elif region_type == MEM_MAPPED:
+                counters.regions_mapped += 1
             next_address = base + size if size else address + 0x10000
             if next_address <= address:
+                counters.notes.append(f"区域前进失败：base={base:x} size={size}")
                 break
-            readable = (
-                info.State == MEM_COMMIT
-                and _is_readable_protect(int(info.Protect or 0))
-                and size > 0
-                and size <= MAX_REGION_SIZE
-                and (not private_only or int(info.Type or 0) == MEM_PRIVATE)
-            )
+            if protect & PAGE_GUARD:
+                counters.regions_skipped_guard += 1
+                address = next_address
+                continue
+            if size > MAX_REGION_SIZE:
+                counters.regions_skipped_size += 1
+                address = next_address
+                continue
+            heap_ok = (not private_only) or region_type in HEAP_TYPES
+            readable = state == MEM_COMMIT and _is_readable_protect(protect) and size > 0 and heap_ok
             if readable:
+                counters.regions_readable += 1
                 overlap = b""
                 offset = 0
                 while offset < size:
@@ -593,14 +819,21 @@ def _for_each_memory_chunk(
                         ctypes.byref(read),
                     )
                     chunk = buffer.raw[: int(read.value)] if ok and read.value else b""
+                    if ok and read.value:
+                        counters.read_ok += 1
+                        counters.bytes_read += int(read.value)
+                    else:
+                        counters.read_fail += 1
+                        counters.read_fail_error = ctypes.get_last_error()
                     payload = overlap + chunk
                     if payload:
-                        callback(payload)
+                        callback(payload, chunk)
                     overlap = payload[-CHUNK_OVERLAP:] if payload else b""
                     offset += request
             address = next_address
     finally:
         _close_handle(handle)
+    return counters
 
 
 # 扫描一个已打开进程的可读内存，提取密钥或数据目录。
@@ -615,7 +848,7 @@ def _scan_process_regions(
     found: list[str] = []
     seen: set[str] = set()
 
-    def consume(payload: bytes) -> None:
+    def consume(payload: bytes, _chunk: bytes) -> None:
         for item in extractor(payload):
             if item not in seen:
                 seen.add(item)
@@ -625,40 +858,8 @@ def _scan_process_regions(
     return found
 
 
-# 一次扫描同时收集密钥候选和 xwechat_files 路径。
-def scan_wechat_process_memory(
-    pid: int,
-    *,
-    on_status: Callable[[str], object] | None = None,
-    stop_event: object | None = None,
-) -> tuple[list[MemoryKeyCandidate], list[Path]]:
-    keys: list[MemoryKeyCandidate] = []
-    by_key: dict[str, int] = {}
-    dir_texts: list[str] = []
-    seen_dirs: set[str] = set()
-
-    def consume(payload: bytes) -> None:
-        for candidate in extract_key_candidates_from_bytes(payload):
-            _remember_key_candidate(keys, by_key, candidate.key_hex, candidate.salt_hex)
-        for item in extract_data_dirs_from_bytes(payload):
-            key = item.casefold()
-            if key not in seen_dirs:
-                seen_dirs.add(key)
-                dir_texts.append(item)
-
-    if on_status is not None:
-        try:
-            on_status("正在扫描微信进程内存")
-        except Exception:
-            pass
-    _for_each_memory_chunk(pid, consume, private_only=True, stop_event=stop_event)
-    if not keys and not getattr(stop_event, "is_set", lambda: False)():
-        if on_status is not None:
-            try:
-                on_status("私有内存未找到密钥，继续扫描全部可读区域")
-            except Exception:
-                pass
-        _for_each_memory_chunk(pid, consume, private_only=False, stop_event=stop_event)
+# 把数据目录字符串收成 xwechat_files 根路径。
+def _normalize_data_dir_hits(dir_texts: Iterable[str]) -> list[Path]:
     paths: list[Path] = []
     seen_paths: set[str] = set()
     for item in dir_texts:
@@ -672,7 +873,56 @@ def scan_wechat_process_memory(
             continue
         seen_paths.add(key)
         paths.append(path)
-    return keys, paths
+    return paths
+
+
+# 一次扫描同时收集密钥候选、路径和探针计数。
+def scan_wechat_process_memory(
+    pid: int,
+    *,
+    salts: Mapping[str, bytes] | None = None,
+    on_status: Callable[[str], object] | None = None,
+    stop_event: object | None = None,
+) -> tuple[list[MemoryKeyCandidate], list[Path], MemoryScanStats]:
+    keys: list[MemoryKeyCandidate] = []
+    by_key: dict[str, int] = {}
+    dir_texts: list[str] = []
+    seen_dirs: set[str] = set()
+    stats = MemoryScanStats(pid=int(pid), python_bits=python_pointer_bits(), admin=is_current_user_admin())
+
+    def consume(payload: bytes, chunk: bytes) -> None:
+        markers = count_probe_markers(chunk, salts)
+        stats.ascii_x_markers += markers["ascii_x_markers"]
+        stats.utf16_x_markers += markers["utf16_x_markers"]
+        stats.ascii_key_hits += markers["ascii_key_hits"]
+        stats.utf16_key_hits += markers["utf16_key_hits"]
+        stats.salt_ascii_hits += markers["salt_ascii_hits"]
+        stats.salt_utf16_hits += markers["salt_utf16_hits"]
+        stats.salt_binary_hits += markers["salt_binary_hits"]
+        stats.data_dir_hits += markers["data_dir_hits"]
+        for candidate in extract_key_candidates_from_bytes(payload, salts):
+            _remember_key_candidate(keys, by_key, candidate.key_hex, candidate.salt_hex)
+        for item in extract_data_dirs_from_bytes(payload):
+            key = item.casefold()
+            if key not in seen_dirs:
+                seen_dirs.add(key)
+                dir_texts.append(item)
+
+    if on_status is not None:
+        try:
+            on_status(f"探针：扫描 PID {pid} 堆内存（私有+映射）")
+        except Exception:
+            pass
+    _for_each_memory_chunk(pid, consume, private_only=True, stop_event=stop_event, stats=stats)
+    if not keys and not getattr(stop_event, "is_set", lambda: False)():
+        stats.notes.append("堆内存未出现完整密钥串，继续扫描全部可读区域")
+        if on_status is not None:
+            try:
+                on_status(f"探针：PID {pid} 堆内存未找到密钥串，扫描全部可读区域")
+            except Exception:
+                pass
+        _for_each_memory_chunk(pid, consume, private_only=False, stop_event=stop_event, stats=stats)
+    return keys, _normalize_data_dir_hits(dir_texts), stats
 
 
 # 从微信进程内存中收集候选 32 字节密钥。
@@ -682,7 +932,7 @@ def scan_process_memory_keys(
     on_status: Callable[[str], object] | None = None,
     stop_event: object | None = None,
 ) -> list[str]:
-    keys, _dirs = scan_wechat_process_memory(pid, on_status=on_status, stop_event=stop_event)
+    keys, _dirs, _stats = scan_wechat_process_memory(pid, on_status=on_status, stop_event=stop_event)
     return [item.key_hex for item in keys]
 
 
@@ -738,9 +988,11 @@ def launch_windows_wechat() -> tuple[bool, str]:
 __all__ = [
     "WECHAT_PROCESS_NAMES",
     "MemoryKeyCandidate",
+    "MemoryScanStats",
     "WindowsProbeError",
     "WindowsProcessInfo",
     "check_process_memory_access",
+    "format_memory_scan_report",
     "extract_data_dirs_from_bytes",
     "extract_hex_keys_from_bytes",
     "extract_key_candidates_from_bytes",
@@ -754,6 +1006,7 @@ __all__ = [
     "normalize_windows_data_root",
     "read_windows_file_version",
     "scan_process_memory_keys",
+    "python_pointer_bits",
     "scan_wechat_process_memory",
     "windows_documents_dir",
     "windows_registry_file_save_paths",

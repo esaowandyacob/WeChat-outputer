@@ -103,6 +103,7 @@ class CaptureResult:
     elapsed_seconds: float
     returncode: int | None
     error: str | None = None
+    report: str = ""
 
     # 返回本次捕获候选的脱敏视图，供 GUI 使用。
     @property
@@ -121,7 +122,7 @@ class CaptureResult:
             f"captured_keys={self.masked_captured_keys!r}, "
             f"validated_keys={masked_validated!r}, "
             f"elapsed_seconds={self.elapsed_seconds!r}, returncode={self.returncode!r}, "
-            f"error={self.error!r})"
+            f"error={self.error!r}, report={self.report!r})"
         )
 
 
@@ -518,7 +519,19 @@ def _attach_discovered_data_roots(validator: Callable[..., object], data_dirs: I
     reader.data_root = next(iter(data_dirs))
 
 
-# 只读扫描 Windows 微信进程内存中的 WCDB 密钥文本。
+# 把探针报告写到密钥目录，便于复制反馈。
+def _write_probe_report(key_path: Path | str, report: str) -> Path | None:
+    try:
+        path = Path(key_path).expanduser()
+        ensure_private_parent(path)
+        log_path = path.parent / "last_capture_probe.txt"
+        log_path.write_text(report + "\n", encoding="utf-8")
+        return log_path
+    except OSError:
+        return None
+
+
+# 只读扫描 Windows 微信进程内存，并输出可观察的探针报告。
 def _capture_keys_windows(
     pid: int,
     validator: Callable[[str], Iterable[str]],
@@ -530,28 +543,87 @@ def _capture_keys_windows(
     on_status: Callable[[str], object] | None = None,
     stop_event: object | None = None,
 ) -> CaptureResult:
-    from windows_memory_probe import WindowsProbeError, scan_wechat_process_memory
+    from windows_memory_probe import (
+        WindowsProbeError,
+        format_memory_scan_report,
+        list_windows_wechat_processes,
+        python_pointer_bits,
+        scan_wechat_process_memory,
+    )
 
     started = time.monotonic()
     candidates: list[str] = []
     seen: set[str] = set()
     validated_records: list[KeyRecord] = []
     error: str | None = None
+    report = ""
+    extra_lines: list[str] = []
+    _notify(on_tick, max(0, int(duration)))
     try:
-        from read_wechat_conversation import discover_message_databases, find_sqlcipher_driver, find_sqlcipher_executable
+        from read_wechat_conversation import (
+            discover_message_databases,
+            find_sqlcipher_driver,
+            find_sqlcipher_executable,
+            read_sqlcipher_salt,
+        )
 
-        deadline = started + max(0, int(duration))
-        _notify(on_status, "正在扫描微信进程内存")
-        while time.monotonic() <= deadline:
+        bits = python_pointer_bits()
+        extra_lines.append(f"SQLCipher 驱动：{'有' if find_sqlcipher_driver() else '无'}")
+        extra_lines.append(f"SQLCipher CLI：{'有' if find_sqlcipher_executable() else '无'}")
+        if bits < 64:
+            error = f"当前 Python 是 {bits} 位，无法读取 64 位微信进程。请改用 64 位 Python。"
+            report = error
+            raise WindowsProbeError(error)
+        processes = list_windows_wechat_processes()
+        extra_lines.append("微信进程：")
+        if not processes:
+            extra_lines.append("  （未枚举到 Weixin.exe / WeChat.exe）")
+        for item in processes:
+            extra_lines.append(
+                f"  PID {item.pid} {item.name} 版本 {item.version or '未知'} 工作集 {item.working_set}"
+            )
+        reader = getattr(validator, "__self__", None)
+        data_root = getattr(reader, "data_root", None) if reader is not None else None
+        message_paths = discover_message_databases(data_root)
+        extra_lines.append(f"message_N.db：{len(message_paths)} 个")
+        salts: dict[str, bytes] = {}
+        plaintext = 0
+        for path in message_paths:
+            salt = read_sqlcipher_salt(path)
+            if salt is None:
+                plaintext += 1
+            else:
+                salts[salt.hex()] = salt
+        extra_lines.append(f"加密库 salt：{len(salts)} 个，明文/无法读头：{plaintext} 个")
+        if salts:
+            extra_lines.append("salt 样例：" + "、".join(list(salts)[:3]))
+        _notify(on_status, f"探针：已发现 {len(message_paths)} 个数据库，开始读进程内存")
+        targets = [int(pid)]
+        for item in processes:
+            if item.pid not in targets:
+                targets.append(item.pid)
+        last_stats = None
+        for target in targets:
             if getattr(stop_event, "is_set", lambda: False)():
                 break
-            remaining = max(0, int(deadline - time.monotonic() + 0.999))
-            _notify(on_tick, remaining)
-            memory_keys, data_dirs = scan_wechat_process_memory(int(pid), on_status=on_status, stop_event=stop_event)
+            memory_keys, data_dirs, last_stats = scan_wechat_process_memory(
+                target,
+                salts=salts,
+                on_status=on_status,
+                stop_event=stop_event,
+            )
+            process = next((item for item in processes if item.pid == target), None)
+            if process is not None and last_stats is not None:
+                last_stats.process_name = process.name
+                last_stats.version = process.version
+                last_stats.working_set = process.working_set
             _attach_discovered_data_roots(validator, data_dirs)
+            if data_dirs:
+                extra_lines.append("内存中的数据目录：" + "；".join(str(item) for item in data_dirs[:3]))
             ordered = [item.key_hex for item in memory_keys if item.salt_hex] + [
                 item.key_hex for item in memory_keys if not item.salt_hex
             ]
+            extra_lines.append(f"PID {target} 完整密钥串：{len(memory_keys)} 个")
             for candidate in ordered:
                 _validate_and_store_candidate(
                     candidate,
@@ -563,37 +635,44 @@ def _capture_keys_windows(
                     candidates,
                     validated_records,
                 )
-            if validated_records or getattr(stop_event, "is_set", lambda: False)():
+            if validated_records:
                 break
-            remaining_wait = deadline - time.monotonic()
-            if remaining_wait <= 0:
-                break
-            _notify(on_status, "尚未验证成功，等待微信加载数据库后重试")
-            time.sleep(min(3.0, remaining_wait))
-        if not validated_records and error is None:
-            has_driver = find_sqlcipher_driver() is not None or find_sqlcipher_executable() is not None
-            has_db = bool(discover_message_databases(getattr(getattr(validator, "__self__", None), "data_root", None)))
-            if not has_driver:
-                error = "未找到 SQLCipher，请先执行 python -m pip install -r requirements.txt"
-            elif not candidates:
-                error = "内存中未找到密钥。请确认已登录微信 4.x，打开几个会话后以管理员身份重试"
-            elif not has_db:
-                error = "已找到候选密钥，但未找到 message_N.db。请在第一步选择微信数据目录"
+        extra_lines.append(f"验证通过：{len(validated_records)} 个，候选：{len(candidates)} 个")
+        if last_stats is not None:
+            report = format_memory_scan_report(last_stats, extra_lines)
+        else:
+            report = "\n".join(["=== Windows 密钥采集探针 ===", *extra_lines])
+        log_path = _write_probe_report(key_path, report)
+        if log_path is not None:
+            extra_lines.append(f"完整日志：{log_path}")
+            if last_stats is not None:
+                report = format_memory_scan_report(last_stats, extra_lines)
             else:
-                error = (
-                    f"已扫描到 {len(candidates)} 个候选密钥，但无法打开数据库。"
-                    "请重新登录微信后再采集，并确认安装了 sqlcipher3"
-                )
+                report = "\n".join(["=== Windows 密钥采集探针 ===", *extra_lines])
+        if not validated_records:
+            if not find_sqlcipher_driver() and not find_sqlcipher_executable():
+                error = "未找到 SQLCipher，请先执行 python -m pip install -r requirements.txt"
+            elif not message_paths and not candidates:
+                error = "未找到 message_N.db，也未在内存中找到密钥串。请选择微信数据目录后重试。"
+            elif not candidates:
+                error = "内存中未出现 WCDB 密钥文本。请把界面里的探针报告发回来。"
+            elif not message_paths:
+                error = "已找到候选密钥，但未找到 message_N.db。请在第一步选择微信数据目录。"
+            else:
+                error = f"已扫描到 {len(candidates)} 个候选，但无法打开数据库。请把探针报告发回来。"
     except WindowsProbeError as exc:
         error = redact_output(str(exc))
+        report = report or error
     except (OSError, KeyStoreError) as exc:
         error = redact_output(str(exc))
-    except Exception:
-        error = "密钥采集过程中发生未预期错误"
+        report = report or error
+    except Exception as exc:
+        error = "密钥采集过程中发生未预期错误：" + redact_output(type(exc).__name__)
+        report = report or error
     finally:
         _notify(on_tick, 0)
     elapsed = time.monotonic() - started
-    return CaptureResult(tuple(candidates), tuple(validated_records), elapsed, None, error)
+    return CaptureResult(tuple(candidates), tuple(validated_records), elapsed, None, error, report)
 
 
 # 在指定微信 PID 上监听固定前缀的 key 行，并逐个调用验证器。
