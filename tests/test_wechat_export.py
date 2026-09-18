@@ -37,6 +37,7 @@ from read_wechat_conversation import (
     find_sqlcipher_driver,
     open_database_backend,
 )
+from windows_key_hook import iter_hook_key_candidates
 from windows_memory_probe import (
     MemoryScanStats,
     ascii_x_hex_length_histogram,
@@ -126,6 +127,14 @@ def test_key_store_is_private(tmp_path: Path) -> None:
     assert load_key_records(path)[0].hex == key
     if os.name != "nt":
         assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+# 验证动态下断读到的缓冲区能切出 32 字节 raw key。
+def test_hook_key_candidates_from_buffer() -> None:
+    key = "ab" * 32
+    assert iter_hook_key_candidates(key, 32) == [key]
+    assert iter_hook_key_candidates(key + "cd" * 16, 48)[0] == key
+    assert iter_hook_key_candidates("zz") == []
 
 
 # 验证运行时已安装可用的 SQLCipher Python 驱动。

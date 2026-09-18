@@ -70,6 +70,19 @@ python -m pip install -r requirements-dev.txt
 
 Windows 若采集时提示无法读取进程内存，请用“以管理员身份运行”的终端再启动。
 
+静态扫内存拿不到 key 时（微信 4.1.x 常见），用动态下断：管理员终端安装 `frida` 后执行：
+
+```bat
+python -m pip install frida
+python windows_key_hook.py
+```
+
+脚本会附加到工作集最大的 `Weixin.exe`，对 `sqlite3_key` / `sqlite3_key_v2` / WCDB `setCipherKey` 下断。然后在微信里登录或打开几个会话。命中并通过 HMAC 的密钥仍写入 `%APPDATA%\WeChatExport\wechat_cccryptor_keys.json`。日志在同目录 `last_key_hook.txt`。若附加失败，可先退出微信再：
+
+```bat
+python windows_key_hook.py --spawn
+```
+
 程序只把完整 key 写入：
 
 ```text

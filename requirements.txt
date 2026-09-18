@@ -6,3 +6,4 @@
 
 zstandard>=0.23.0
 sqlcipher3>=0.6.2
+# Windows 动态下断（可选）：python -m pip install frida
