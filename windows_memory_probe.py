@@ -12,6 +12,7 @@ import os
 import re
 import struct
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -48,6 +49,12 @@ BOGUS_REGION_SIZE = 8 * 1024 * 1024 * 1024
 PROBE_STRINGS = (
     b"PRAGMA key",
     b"PRAGMA cipher",
+    b"sqlcipher_codec",
+    b"Config.Cipher",
+    b"setCipherKey",
+    b"WCDB_CT_",
+    b"raw_key",
+    b"hexkey",
     b"cipher_key",
     b"cipher_salt",
     b"sqlite3_key",
@@ -133,6 +140,8 @@ class MemoryScanStats:
     salt_ascii_hits: int = 0
     salt_utf16_hits: int = 0
     salt_binary_hits: int = 0
+    salt_binary_private: int = 0
+    salt_binary_mapped: int = 0
     data_dir_hits: int = 0
     skipped_large_bytes: int = 0
     ascii_hex_lengths: dict[str, int] = None  # type: ignore[assignment]
@@ -266,6 +275,8 @@ def collect_salt_hit_samples(
     salts: Mapping[str, bytes],
     *,
     limit: int = 8,
+    context: int = 128,
+    include_ascii: bool = True,
 ) -> list[tuple[str, str, str, str]]:
     raw = bytes(data)
     samples: list[tuple[str, str, str, str]] = []
@@ -277,10 +288,12 @@ def collect_salt_hit_samples(
             index = raw.find(salt, start)
             if index < 0:
                 break
-            before = raw[max(0, index - 128) : index].hex()
-            after = raw[index + len(salt) : index + len(salt) + 128].hex()
+            before = raw[max(0, index - context) : index].hex()
+            after = raw[index + len(salt) : index + len(salt) + context].hex()
             samples.append(("binary", salt_hex, before, after))
             start = index + 1
+        if not include_ascii:
+            continue
         needle = salt_hex.encode("ascii")
         start = 0
         while len(samples) < limit:
@@ -344,11 +357,14 @@ def collect_probe_string_hits(data: bytes, *, limit: int = 8) -> list[str]:
     hits: list[str] = []
     preferred = (
         b"sqlite3_key",
+        b"sqlcipher_codec",
+        b"Config.Cipher",
+        b"setCipherKey",
         b"PRAGMA key",
         b"PRAGMA cipher_salt",
         b"PRAGMA cipher_page_size",
         b"cipher_key",
-        b"setCipherKey",
+        b"WCDB_CT_",
     )
     needles = list(preferred)
     needles.extend(item.decode("ascii").encode("utf-16le") for item in preferred)
@@ -506,7 +522,7 @@ def format_memory_scan_report(stats: MemoryScanStats, extra_lines: Sequence[str]
             ),
             (
                 f"已知库 salt：ASCII {stats.salt_ascii_hits}，UTF-16 {stats.salt_utf16_hits}，"
-                f"二进制 {stats.salt_binary_hits}"
+                f"二进制 {stats.salt_binary_hits}（私有堆 {stats.salt_binary_private}，映射 {stats.salt_binary_mapped}）"
             ),
             "x' 后 hex 长度："
             + (
@@ -984,9 +1000,10 @@ def _is_readable_protect(protect: int) -> bool:
 # 对进程可读内存逐块回调，并填写探针计数。
 def _for_each_memory_chunk(
     pid: int,
-    callback: Callable[[bytes, bytes], object],
+    callback: Callable[..., object],
     *,
     private_only: bool,
+    region_types: set[int] | None = None,
     stop_event: object | None = None,
     stats: MemoryScanStats | None = None,
 ) -> MemoryScanStats:
@@ -1046,7 +1063,8 @@ def _for_each_memory_chunk(
                     counters.skipped_large_examples.append(size)
                 address = next_address
                 continue
-            heap_ok = (not private_only) or region_type in HEAP_TYPES
+            allowed = region_types if region_types is not None else (HEAP_TYPES if private_only else None)
+            heap_ok = allowed is None or region_type in allowed
             readable = state == MEM_COMMIT and _is_readable_protect(protect) and size > 0 and heap_ok
             if readable:
                 counters.regions_readable += 1
@@ -1074,7 +1092,7 @@ def _for_each_memory_chunk(
                         counters.read_fail_error = ctypes.get_last_error()
                     payload = overlap + chunk
                     if payload:
-                        callback(payload, chunk)
+                        callback(payload, chunk, region_type)
                     overlap = payload[-CHUNK_OVERLAP:] if payload else b""
                     offset += request
             address = next_address
@@ -1095,7 +1113,7 @@ def _scan_process_regions(
     found: list[str] = []
     seen: set[str] = set()
 
-    def consume(payload: bytes, _chunk: bytes) -> None:
+    def consume(payload: bytes, _chunk: bytes, _region_type: int = 0) -> None:
         for item in extractor(payload):
             if item not in seen:
                 seen.add(item)
@@ -1137,7 +1155,7 @@ def scan_wechat_process_memory(
     seen_dirs: set[str] = set()
     stats = MemoryScanStats(pid=int(pid), python_bits=python_pointer_bits(), admin=is_current_user_admin())
 
-    def consume(payload: bytes, chunk: bytes) -> None:
+    def consume(payload: bytes, chunk: bytes, region_type: int = 0) -> None:
         markers = count_probe_markers(chunk, salts)
         stats.ascii_x_markers += markers["ascii_x_markers"]
         stats.utf16_x_markers += markers["utf16_x_markers"]
@@ -1146,6 +1164,12 @@ def scan_wechat_process_memory(
         stats.salt_ascii_hits += markers["salt_ascii_hits"]
         stats.salt_utf16_hits += markers["salt_utf16_hits"]
         stats.salt_binary_hits += markers["salt_binary_hits"]
+        if salts:
+            binary_hits = sum(chunk.count(salt) for salt in salts.values())
+            if region_type == MEM_PRIVATE:
+                stats.salt_binary_private += binary_hits
+            elif region_type == MEM_MAPPED:
+                stats.salt_binary_mapped += binary_hits
         stats.data_dir_hits += markers["data_dir_hits"]
         stats.pragma_key_hits += count_token(chunk, b"PRAGMA key")
         stats.pragma_salt_hits += count_token(chunk, b"PRAGMA cipher_salt")
@@ -1154,8 +1178,16 @@ def scan_wechat_process_memory(
         for name, count in markers["ascii_hex_lengths"].items():
             stats.ascii_hex_lengths[name] = stats.ascii_hex_lengths.get(name, 0) + count
         if salts:
-            if len(stats.salt_samples) < 8:
-                stats.salt_samples.extend(collect_salt_hit_samples(chunk, salts, limit=8 - len(stats.salt_samples)))
+            if region_type == MEM_PRIVATE and len(stats.salt_samples) < 12:
+                stats.salt_samples.extend(
+                    collect_salt_hit_samples(
+                        chunk,
+                        salts,
+                        limit=12 - len(stats.salt_samples),
+                        context=2048,
+                        include_ascii=False,
+                    )
+                )
             if len(stats.x32_values) < 8:
                 for item in collect_x32_hex_values(chunk, limit=8 - len(stats.x32_values)):
                     if item not in stats.x32_values:
@@ -1164,8 +1196,11 @@ def scan_wechat_process_memory(
                 stats.salt_follow32.extend(
                     collect_follow_bytes_after_salt_hex(chunk, salts, limit=8 - len(stats.salt_follow32))
                 )
-        if len(stats.pragma_samples) < 8:
-            stats.pragma_samples.extend(collect_probe_string_hits(chunk, limit=8 - len(stats.pragma_samples)))
+        if len(stats.pragma_samples) < 12:
+            for item in collect_probe_string_hits(chunk, limit=12 - len(stats.pragma_samples)):
+                if any(noise in item for noise in ("密钥采集探针", "精确计数", "last_capture_probe", "HMAC 滑窗")):
+                    continue
+                stats.pragma_samples.append(item)
         for candidate in extract_key_candidates_from_bytes(payload, salts):
             _remember_key_candidate(keys, by_key, candidate.key_hex, candidate.salt_hex)
         for item in extract_data_dirs_from_bytes(payload):
@@ -1189,6 +1224,72 @@ def scan_wechat_process_memory(
                 pass
         _for_each_memory_chunk(pid, consume, private_only=False, stop_event=stop_event, stats=stats)
     return keys, _normalize_data_dir_hits(dir_texts), stats
+
+
+# 在私有堆上按对齐暴力 HMAC，把 32 字节窗口对每个库第一页做校验。
+def hmac_brute_private_heap(
+    pid: int,
+    pages_by_salt: Mapping[str, bytes],
+    *,
+    alignment: int = 16,
+    deadline: float | None = None,
+    on_status: Callable[[str], object] | None = None,
+    stop_event: object | None = None,
+) -> tuple[list[tuple[str, str]], dict[str, int]]:
+    from read_wechat_conversation import sqlcipher4_raw_key_matches
+
+    remaining = dict(pages_by_salt)
+    found: list[tuple[str, str]] = []
+    counters = {"bytes": 0, "windows": 0, "tested": 0}
+    last_status = 0.0
+
+    def consume(payload: bytes, chunk: bytes, region_type: int = 0) -> None:
+        nonlocal last_status
+        if region_type != MEM_PRIVATE or not remaining:
+            return
+        data = payload
+        limit = len(data) - 31
+        offset = 0
+        while offset < limit:
+            if getattr(stop_event, "is_set", lambda: False)():
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            key = data[offset : offset + 32]
+            offset += alignment
+            counters["windows"] += 1
+            if len(set(key)) < 10:
+                continue
+            counters["tested"] += 1
+            matched: list[str] = []
+            for salt_hex, page in remaining.items():
+                if sqlcipher4_raw_key_matches(page, key):
+                    found.append((salt_hex, key.hex()))
+                    matched.append(salt_hex)
+            for salt_hex in matched:
+                remaining.pop(salt_hex, None)
+            if not remaining:
+                return
+        counters["bytes"] += len(chunk)
+        now = time.monotonic()
+        if on_status is not None and now - last_status >= 3:
+            last_status = now
+            try:
+                on_status(
+                    f"堆暴力 HMAC：已读 {counters['bytes'] // (1024 * 1024)} MB，"
+                    f"窗口 {counters['windows']}，待匹配库 {len(remaining)}"
+                )
+            except Exception:
+                pass
+
+    _for_each_memory_chunk(
+        pid,
+        consume,
+        private_only=True,
+        region_types={MEM_PRIVATE},
+        stop_event=stop_event,
+    )
+    return found, counters
 
 
 # 从微信进程内存中收集候选 32 字节密钥。
@@ -1259,6 +1360,7 @@ __all__ = [
     "WindowsProcessInfo",
     "check_process_memory_access",
     "format_memory_scan_report",
+    "hmac_brute_private_heap",
     "extract_data_dirs_from_bytes",
     "extract_hex_keys_from_bytes",
     "extract_key_candidates_from_bytes",

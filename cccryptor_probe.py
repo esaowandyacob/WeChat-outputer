@@ -546,6 +546,7 @@ def _capture_keys_windows(
     from windows_memory_probe import (
         WindowsProbeError,
         format_memory_scan_report,
+        hmac_brute_private_heap,
         is_current_user_admin,
         list_windows_wechat_processes,
         python_pointer_bits,
@@ -602,11 +603,10 @@ def _capture_keys_windows(
         extra_lines.append(f"加密库 salt：{len(salts)} 个，明文/无法读头：{plaintext} 个")
         if salts:
             extra_lines.append("salt 样例：" + "、".join(list(salts)[:3]))
-        extra_lines.append("请优先看工作集最大的 PID 明细，不要看最小的辅助进程。")
-        _notify(on_status, f"探针：已发现 {len(message_paths)} 个数据库，开始读进程内存")
-        ordered_processes = sorted(processes, key=lambda item: -item.working_set)
+        extra_lines.append("只扫描工作集最大的主进程；完整探针包含堆 HMAC 滑窗和私有堆暴力校验，可能需要十几分钟。")
+        _notify(on_status, f"探针：已发现 {len(message_paths)} 个数据库，开始读主进程内存")
+        ordered_processes = sorted(processes, key=lambda item: -item.working_set)[:1]
         if not ordered_processes:
-            ordered_processes = []
             extra_lines.append("未找到可扫描的微信进程")
         process_reports: list[str] = []
         for process in ordered_processes:
@@ -659,7 +659,7 @@ def _capture_keys_windows(
                     window = before_bytes + bytes.fromhex(salt_hex) + after_bytes
                     salt_at = len(before_bytes)
                     hits: list[int] = []
-                    for offset in range(0, max(0, len(window) - 31), 8):
+                    for offset in range(0, max(0, len(window) - 31), 4):
                         if sqlcipher4_raw_key_matches(page, window[offset : offset + 32]):
                             hits.append(offset - salt_at)
                     extra_lines.append(
@@ -739,8 +739,55 @@ def _capture_keys_windows(
                     validated_records,
                 )
             if validated_records:
-                extra_lines.append(f"PID {process.pid} 已验证通过，停止扫描其余进程")
+                extra_lines.append(f"PID {process.pid} 已验证通过，停止后续探针")
                 break
+            extra_lines.append(
+                f"  salt 分区：私有堆 {stats.salt_binary_private}，映射文件 {stats.salt_binary_mapped}"
+            )
+            pages_by_salt: dict[str, bytes] = {}
+            for path in message_paths:
+                salt = read_sqlcipher_salt(path)
+                if salt is None:
+                    continue
+                try:
+                    pages_by_salt[salt.hex()] = path.read_bytes()[:4096]
+                except OSError:
+                    continue
+            if pages_by_salt and not validated_records:
+                brute_deadline = started + max(120, int(duration))
+                extra_lines.append(
+                    f"开始私有堆暴力 HMAC（对齐 16 字节，截止 {max(120, int(duration))} 秒）"
+                )
+
+                def brute_status(detail: str) -> None:
+                    remaining = max(0, int(brute_deadline - time.monotonic()))
+                    _notify(on_tick, remaining)
+                    _notify(on_status, detail)
+
+                brute_hits, brute_stats = hmac_brute_private_heap(
+                    process.pid,
+                    pages_by_salt,
+                    alignment=16,
+                    deadline=brute_deadline,
+                    on_status=brute_status,
+                    stop_event=stop_event,
+                )
+                extra_lines.append(
+                    f"  堆暴力：读 {brute_stats.get('bytes', 0)} 字节，窗口 {brute_stats.get('windows', 0)}，"
+                    f"实测 {brute_stats.get('tested', 0)}，命中 {len(brute_hits)}"
+                )
+                for salt_hex, key_hex in brute_hits:
+                    extra_lines.append(f"  堆暴力命中 salt={salt_hex[:16]}…")
+                    _validate_and_store_candidate(
+                        key_hex,
+                        validator,
+                        key_path,
+                        on_candidate,
+                        on_status,
+                        seen,
+                        candidates,
+                        validated_records,
+                    )
         extra_lines.append(f"验证通过：{len(validated_records)} 个，候选：{len(candidates)} 个")
         header = [
             "=== Windows 密钥采集探针 ===",

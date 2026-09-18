@@ -510,10 +510,11 @@ class WeChatExportApp(tk.Tk):
         capture_button = self.capture_row.winfo_children()[-1]
         if isinstance(capture_button, FlatButton):
             capture_button.set_enabled(False)
-        self.capture_var.set("⏳ 启动密钥采集（剩余 60 秒）")
+        duration = 1200 if sys.platform == "win32" else 60
+        self.capture_var.set(f"⏳ 启动密钥采集（剩余 {duration} 秒）")
         self._captured_masks = []
         listening_hint = (
-            "正在扫描微信进程内存，请保持微信已登录…"
+            "正在跑完整内存探针（含堆 HMAC，可能 10–20 分钟），请保持微信已登录…"
             if sys.platform == "win32"
             else "正在监听，请在微信中登录并打开几个会话…"
         )
@@ -548,7 +549,7 @@ class WeChatExportApp(tk.Tk):
                 result = capture_keys(
                     status.pid or 0,
                     self.reader.validate_candidate_key,
-                    duration=60,
+                    duration=duration,
                     key_path=self.key_path,
                     on_tick=on_tick,
                     on_candidate=on_candidate,
