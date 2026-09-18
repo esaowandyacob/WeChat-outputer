@@ -625,9 +625,11 @@ def _capture_keys_windows(
             extra_lines.append(
                 f"PID {process.pid} 工作集 {process.working_set}：密钥串 {len(memory_keys)}，"
                 f"读到 {stats.bytes_read} 字节，读失败 {stats.read_fail}，"
-                f"salt 二进制 {stats.salt_binary_hits}，x' 标记 {stats.ascii_x_markers}，"
-                f"x'后hex {stats.ascii_hex_lengths}"
+                f"salt 二进制 {stats.salt_binary_hits}，精确 PRAGMA key={stats.pragma_key_hits} "
+                f"cipher_salt={stats.pragma_salt_hits} sqlite3_key={stats.sqlite3_key_hits}"
             )
+            if any("requires a key of one or more characters" in item for item in stats.pragma_samples):
+                extra_lines.append("  说明：PRAGMA key 命中是 SQLCipher 内置帮助文本，不是运行时设钥。")
             if stats.salt_samples or stats.x32_values:
                 from read_wechat_conversation import sqlcipher4_raw_key_matches
 
@@ -644,27 +646,38 @@ def _capture_keys_windows(
                     if kind != "binary":
                         extra_lines.append(f"  ascii salt={salt_hex[:16]}… prefix80={after[:96]}")
                         continue
-                    for label, blob in (("before32", before), ("after32", after)):
-                        if len(blob) != 64:
-                            extra_lines.append(f"  HMAC {kind} {label}：长度不是 32 字节")
-                            continue
-                        page = pages_by_salt.get(salt_hex)
-                        if page is None:
-                            extra_lines.append(f"  HMAC {kind} {label}：没有对应数据库页")
-                            continue
-                        matched = sqlcipher4_raw_key_matches(page, bytes.fromhex(blob))
-                        extra_lines.append(f"  HMAC {kind} salt={salt_hex[:16]}… {label}={matched}")
-                        if matched:
-                            _validate_and_store_candidate(
-                                blob,
-                                validator,
-                                key_path,
-                                on_candidate,
-                                on_status,
-                                seen,
-                                candidates,
-                                validated_records,
-                            )
+                    page = pages_by_salt.get(salt_hex)
+                    if page is None:
+                        extra_lines.append(f"  HMAC binary salt={salt_hex[:16]}… 没有对应数据库页")
+                        continue
+                    try:
+                        before_bytes = bytes.fromhex(before) if before else b""
+                        after_bytes = bytes.fromhex(after) if after else b""
+                    except ValueError:
+                        extra_lines.append(f"  HMAC binary salt={salt_hex[:16]}… 邻域不是合法 hex")
+                        continue
+                    window = before_bytes + bytes.fromhex(salt_hex) + after_bytes
+                    salt_at = len(before_bytes)
+                    hits: list[int] = []
+                    for offset in range(0, max(0, len(window) - 31), 8):
+                        if sqlcipher4_raw_key_matches(page, window[offset : offset + 32]):
+                            hits.append(offset - salt_at)
+                    extra_lines.append(
+                        f"  HMAC 滑窗 salt={salt_hex[:16]}… 窗口={len(window)} 命中偏移={hits or '无'}"
+                    )
+                    for relative in hits:
+                        start = salt_at + relative
+                        blob = window[start : start + 32].hex()
+                        _validate_and_store_candidate(
+                            blob,
+                            validator,
+                            key_path,
+                            on_candidate,
+                            on_status,
+                            seen,
+                            candidates,
+                            validated_records,
+                        )
                 for value in stats.x32_values:
                     extra_lines.append(f"  x'32hex={value} 是否已知salt={value in salts}")
                     if value in salts:

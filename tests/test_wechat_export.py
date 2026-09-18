@@ -285,8 +285,8 @@ def test_extract_hex_keys_from_memory_bytes() -> None:
     blob = b"zzzz" + (b"\x11" * 32) + salt + (b"\x22" * 32)
     samples = collect_salt_hit_samples(blob, {salt.hex(): salt})
     assert samples[0][0] == "binary"
-    assert samples[0][2] == (b"\x11" * 32).hex()
-    assert samples[0][3] == (b"\x22" * 32).hex()
+    assert samples[0][2].endswith((b"\x11" * 32).hex())
+    assert samples[0][3].startswith((b"\x22" * 32).hex())
     assert collect_x32_hex_values(b"x'" + (b"ab" * 16) + b"zz") == ["ab" * 16]
     pragma_hits = collect_probe_string_hits(b"xxPRAGMA cipher_salt = x'aabb'yy")
     assert any("cipher_salt" in item for item in pragma_hits)

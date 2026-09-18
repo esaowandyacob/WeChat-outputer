@@ -277,8 +277,8 @@ def collect_salt_hit_samples(
             index = raw.find(salt, start)
             if index < 0:
                 break
-            before = raw[index - 32 : index].hex() if index >= 32 else ""
-            after = raw[index + len(salt) : index + len(salt) + 32].hex() if index + len(salt) + 32 <= len(raw) else ""
+            before = raw[max(0, index - 128) : index].hex()
+            after = raw[index + len(salt) : index + len(salt) + 128].hex()
             samples.append(("binary", salt_hex, before, after))
             start = index + 1
         needle = salt_hex.encode("ascii")
@@ -342,7 +342,14 @@ def collect_follow_bytes_after_salt_hex(
 def collect_probe_string_hits(data: bytes, *, limit: int = 8) -> list[str]:
     raw = bytes(data)
     hits: list[str] = []
-    preferred = (b"PRAGMA key", b"PRAGMA cipher_salt", b"PRAGMA cipher_page_size", b"cipher_key", b"setCipherKey")
+    preferred = (
+        b"sqlite3_key",
+        b"PRAGMA key",
+        b"PRAGMA cipher_salt",
+        b"PRAGMA cipher_page_size",
+        b"cipher_key",
+        b"setCipherKey",
+    )
     needles = list(preferred)
     needles.extend(item.decode("ascii").encode("utf-16le") for item in preferred)
     for needle in needles:
@@ -352,6 +359,10 @@ def collect_probe_string_hits(data: bytes, *, limit: int = 8) -> list[str]:
             index = raw.find(needle, start)
             if index < 0:
                 break
+            nxt = raw[index + len(needle) : index + len(needle) + 1]
+            if nxt and nxt in b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_":
+                start = index + 1
+                continue
             window = raw[index : index + 200]
             printable = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in window)
             hits.append(f"{label}: {printable}")
