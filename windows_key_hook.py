@@ -14,7 +14,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -152,13 +155,10 @@ def handle_payload(
     log_lines.append(line)
     saved = 0
     candidates = iter_hook_key_candidates(hex_blob, nkey)
-    if nkey == 16 or (len(hex_blob) >= 32 and nkey not in {32, 48, 64}):
+    if nkey in {16, 32, 48} and len(hex_blob) >= 32:
         salts = {salt: page[:16] for salt, (_path, page) in pages.items()}
-        candidates.extend(iter_passphrase_candidates(hex_blob, salts))
-    regs = payload.get("regs") or {}
-    for name in ("rdx_hex32", "r8_hex32", "rcx_hex32", "r9_hex32"):
-        extra = str(regs.get(name) or "")
-        candidates.extend(iter_hook_key_candidates(extra, 32))
+        if nkey == 16:
+            candidates.extend(iter_passphrase_candidates(hex_blob, salts))
     seen: set[str] = set()
     for candidate in candidates:
         if candidate in seen:
@@ -182,7 +182,7 @@ def main() -> int:
     parser.add_argument("--pid", type=int, default=0, help="指定 PID，默认附加工作集最大的 Weixin.exe")
     parser.add_argument("--all", action="store_true", help="附加所有 Weixin.exe")
     parser.add_argument("--spawn", action="store_true", help="由脚本启动微信再附加（部分反调试有效）")
-    parser.add_argument("--timeout", type=int, default=0, help="秒后自动结束，0 表示直到 Ctrl+C")
+    parser.add_argument("--timeout", type=int, default=180, help="秒后自动结束，默认 180")
     parser.add_argument("--data-root", default="", help="微信数据目录，默认自动检测")
     args = parser.parse_args()
     log_lines = ["=== Windows sqlite3_key 动态下断 ==="]
@@ -259,15 +259,25 @@ def main() -> int:
         script.on("message", on_message)
         script.load()
         scripts.append(script)
-    print("下断已安装。请切换到微信：登录或打开几个聊天窗口。Ctrl+C 结束。")
+    print("下断已安装。请在微信里登录或打开几个会话。")
+    print("停止：Ctrl+C，或 Windows 下 Ctrl+Break。默认 180 秒后自动退出。")
+    stop = threading.Event()
+
+    def request_stop(_signum: int | None = None, _frame: object | None = None) -> None:
+        print("\n正在停止，请稍等…")
+        stop.set()
+        threading.Timer(3.0, lambda: os._exit(1)).start()
+
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, request_stop)
     started = time.monotonic()
     try:
-        while True:
+        while not stop.is_set():
             if args.timeout and time.monotonic() - started >= args.timeout:
+                print("已到超时时间，自动结束。")
                 break
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("\n结束下断。")
+            stop.wait(0.5)
     finally:
         for script in scripts:
             try:
@@ -286,6 +296,8 @@ def main() -> int:
             print(f"探针日志：{key_path.parent / 'last_key_hook.txt'}")
         except OSError:
             pass
+        if stop.is_set():
+            os._exit(0 if saved_total else 1)
     return 0 if saved_total else 1
 
 
