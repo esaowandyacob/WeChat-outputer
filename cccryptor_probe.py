@@ -1,10 +1,9 @@
-"""微信进程密钥采集与本地密钥文件管理。
+"""macOS 微信进程密钥采集与本地密钥文件管理。
 
-本模块只负责三件事：检测系统/微信状态、采集候选密钥、以及把已经验证
-过的密钥安全地保存到本机。macOS 使用 DTrace 监听 ``CCCryptorCreate``；
-Windows 只读扫描 ``Weixin.exe`` 进程内存中的 WCDB 密钥文本。数据库读取
-和业务解析位于 ``read_wechat_conversation.py``，这样即使密钥采集失败也
-不会影响导出器的测试和离线使用。
+本模块检测微信状态、用 DTrace 监听 ``CCCryptorCreate`` 采集候选密钥，
+以及把已经验证过的密钥保存到本机。Linux / Windows 的内存密钥提取在
+``wxwatch.keyscan`` / ``wxwatch.keyscan_win``，入口是 ``main.py``。
+数据库读取和导出位于 ``read_wechat_conversation.py``。
 """
 
 from __future__ import annotations
@@ -374,13 +373,9 @@ def build_dtrace_program() -> str:
 
 # 检查当前平台是否具备采集密钥的进程访问条件。
 def check_capture_probe(pid: int, timeout: float = 8.0) -> tuple[bool, str]:
-    if sys.platform == "win32":
-        from windows_memory_probe import check_process_memory_access
-
-        return check_process_memory_access(int(pid))
     if sys.platform == "darwin":
         return check_dtrace_probe(pid, timeout)
-    return False, "当前系统不支持自动采集密钥"
+    return False, "macOS 以外请使用 python main.py extract-keys"
 
 
 # 运行题目要求的 DTrace probe 列表检查，并返回脱敏后的诊断文本。
@@ -430,7 +425,7 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
                 pass
 
 
-# 按当前操作系统采集密钥：macOS 用 DTrace，Windows 扫描进程内存。
+# macOS 用 DTrace 采集密钥。Linux / Windows 走 main.py。
 def capture_keys(
     pid: int,
     validator: Callable[[str], Iterable[str]],
@@ -442,17 +437,6 @@ def capture_keys(
     on_status: Callable[[str], object] | None = None,
     stop_event: object | None = None,
 ) -> CaptureResult:
-    if sys.platform == "win32":
-        return _capture_keys_windows(
-            pid,
-            validator,
-            duration=duration,
-            key_path=key_path,
-            on_tick=on_tick,
-            on_candidate=on_candidate,
-            on_status=on_status,
-            stop_event=stop_event,
-        )
     if sys.platform == "darwin":
         return _capture_keys_dtrace(
             pid,
@@ -465,364 +449,6 @@ def capture_keys(
             stop_event=stop_event,
         )
     return CaptureResult((), (), 0.0, None, "当前系统不支持自动采集密钥")
-
-
-# 把采集到的候选密钥交给验证器，验证成功后写入本地密钥文件。
-def _validate_and_store_candidate(
-    candidate: str,
-    validator: Callable[[str], Iterable[str]],
-    key_path: Path | str,
-    on_candidate: Callable[[str], object] | None,
-    on_status: Callable[[str], object] | None,
-    seen: set[str],
-    candidates: list[str],
-    validated_records: list[KeyRecord],
-) -> None:
-    if candidate in seen:
-        return
-    seen.add(candidate)
-    candidates.append(candidate)
-    masked = mask_key(candidate)
-    _notify(on_candidate, masked)
-    try:
-        validated_names = validator(candidate)
-        if isinstance(validated_names, (str, os.PathLike)):
-            validated_names = (validated_names,)
-        database_names = tuple(sorted({Path(str(item)).name for item in validated_names if str(item).strip()}))
-    except Exception:
-        database_names = tuple()
-    if not database_names:
-        _notify(on_status, f"候选密钥 {masked} 未通过数据库验证")
-        return
-    record = save_validated_key(candidate, database_names, key_path)
-    validated_records.append(record)
-    _notify(on_status, f"候选密钥 {masked} 已验证并保存")
-
-
-# 若验证器绑定了 WeChatReader，则用内存里发现的数据目录补全扫描根。
-def _attach_discovered_data_roots(validator: Callable[..., object], data_dirs: Iterable[Path]) -> None:
-    reader = getattr(validator, "__self__", None)
-    if reader is None or not data_dirs:
-        return
-    current = getattr(reader, "data_root", None)
-    if current is not None:
-        return
-    from read_wechat_conversation import discover_message_databases
-
-    for root in data_dirs:
-        try:
-            if discover_message_databases(root):
-                reader.data_root = root
-                return
-        except Exception:
-            continue
-    reader.data_root = next(iter(data_dirs))
-
-
-# 把探针报告写到密钥目录，便于复制反馈。
-def _write_probe_report(key_path: Path | str, report: str) -> Path | None:
-    try:
-        path = Path(key_path).expanduser()
-        ensure_private_parent(path)
-        log_path = path.parent / "last_capture_probe.txt"
-        log_path.write_text(report + "\n", encoding="utf-8")
-        return log_path
-    except OSError:
-        return None
-
-
-# 只读扫描 Windows 微信进程内存，并输出可观察的探针报告。
-def _capture_keys_windows(
-    pid: int,
-    validator: Callable[[str], Iterable[str]],
-    *,
-    duration: int = 60,
-    key_path: Path | str = DEFAULT_KEY_PATH,
-    on_tick: Callable[[int], object] | None = None,
-    on_candidate: Callable[[str], object] | None = None,
-    on_status: Callable[[str], object] | None = None,
-    stop_event: object | None = None,
-) -> CaptureResult:
-    from windows_memory_probe import (
-        WindowsProbeError,
-        format_memory_scan_report,
-        hmac_brute_private_heap,
-        is_current_user_admin,
-        list_windows_wechat_processes,
-        python_pointer_bits,
-        scan_wechat_process_memory,
-    )
-
-    started = time.monotonic()
-    candidates: list[str] = []
-    seen: set[str] = set()
-    validated_records: list[KeyRecord] = []
-    error: str | None = None
-    report = ""
-    extra_lines: list[str] = []
-    _notify(on_tick, max(0, int(duration)))
-    try:
-        from read_wechat_conversation import (
-            discover_message_databases,
-            find_sqlcipher_driver,
-            find_sqlcipher_executable,
-            read_sqlcipher_salt,
-        )
-
-        bits = python_pointer_bits()
-        extra_lines.append(f"SQLCipher 驱动：{'有' if find_sqlcipher_driver() else '无'}")
-        extra_lines.append(f"SQLCipher CLI：{'有' if find_sqlcipher_executable() else '无'}")
-        admin = is_current_user_admin()
-        extra_lines.append(
-            "管理员：" + ("是" if admin else "否") + ("。未提权时主进程（约 1GB）可能有页面读不到。" if admin is False else "")
-        )
-        if bits < 64:
-            error = f"当前 Python 是 {bits} 位，无法读取 64 位微信进程。请改用 64 位 Python。"
-            report = error
-            raise WindowsProbeError(error)
-        processes = list_windows_wechat_processes()
-        extra_lines.append("微信进程：")
-        if not processes:
-            extra_lines.append("  （未枚举到 Weixin.exe / WeChat.exe）")
-        for item in processes:
-            extra_lines.append(
-                f"  PID {item.pid} {item.name} 版本 {item.version or '未知'} 工作集 {item.working_set}"
-            )
-        reader = getattr(validator, "__self__", None)
-        data_root = getattr(reader, "data_root", None) if reader is not None else None
-        message_paths = discover_message_databases(data_root)
-        extra_lines.append(f"message_N.db：{len(message_paths)} 个")
-        salts: dict[str, bytes] = {}
-        plaintext = 0
-        for path in message_paths:
-            salt = read_sqlcipher_salt(path)
-            if salt is None:
-                plaintext += 1
-            else:
-                salts[salt.hex()] = salt
-        extra_lines.append(f"加密库 salt：{len(salts)} 个，明文/无法读头：{plaintext} 个")
-        if salts:
-            extra_lines.append("salt 样例：" + "、".join(list(salts)[:3]))
-        extra_lines.append("只扫描工作集最大的主进程；完整探针包含堆 HMAC 滑窗和私有堆暴力校验，可能需要十几分钟。")
-        _notify(on_status, f"探针：已发现 {len(message_paths)} 个数据库，开始读主进程内存")
-        ordered_processes = sorted(processes, key=lambda item: -item.working_set)[:1]
-        if not ordered_processes:
-            extra_lines.append("未找到可扫描的微信进程")
-        process_reports: list[str] = []
-        for process in ordered_processes:
-            if getattr(stop_event, "is_set", lambda: False)():
-                break
-            memory_keys, data_dirs, stats = scan_wechat_process_memory(
-                process.pid,
-                salts=salts,
-                on_status=on_status,
-                stop_event=stop_event,
-            )
-            stats.process_name = process.name
-            stats.version = process.version
-            stats.working_set = process.working_set
-            _attach_discovered_data_roots(validator, data_dirs)
-            extra_lines.append(
-                f"PID {process.pid} 工作集 {process.working_set}：密钥串 {len(memory_keys)}，"
-                f"读到 {stats.bytes_read} 字节，读失败 {stats.read_fail}，"
-                f"salt 二进制 {stats.salt_binary_hits}，精确 PRAGMA key={stats.pragma_key_hits} "
-                f"cipher_salt={stats.pragma_salt_hits} sqlite3_key={stats.sqlite3_key_hits}"
-            )
-            if any("requires a key of one or more characters" in item for item in stats.pragma_samples):
-                extra_lines.append("  说明：PRAGMA key 命中是 SQLCipher 内置帮助文本，不是运行时设钥。")
-            if stats.salt_samples or stats.x32_values:
-                from read_wechat_conversation import sqlcipher4_raw_key_matches
-
-                pages_by_salt: dict[str, bytes] = {}
-                for path in message_paths:
-                    salt = read_sqlcipher_salt(path)
-                    if salt is None:
-                        continue
-                    try:
-                        pages_by_salt[salt.hex()] = path.read_bytes()[:4096]
-                    except OSError:
-                        continue
-                for kind, salt_hex, before, after in stats.salt_samples:
-                    if kind != "binary":
-                        extra_lines.append(f"  ascii salt={salt_hex[:16]}… prefix80={after[:96]}")
-                        continue
-                    page = pages_by_salt.get(salt_hex)
-                    if page is None:
-                        extra_lines.append(f"  HMAC binary salt={salt_hex[:16]}… 没有对应数据库页")
-                        continue
-                    try:
-                        before_bytes = bytes.fromhex(before) if before else b""
-                        after_bytes = bytes.fromhex(after) if after else b""
-                    except ValueError:
-                        extra_lines.append(f"  HMAC binary salt={salt_hex[:16]}… 邻域不是合法 hex")
-                        continue
-                    window = before_bytes + bytes.fromhex(salt_hex) + after_bytes
-                    salt_at = len(before_bytes)
-                    hits: list[int] = []
-                    for offset in range(0, max(0, len(window) - 31), 4):
-                        if sqlcipher4_raw_key_matches(page, window[offset : offset + 32]):
-                            hits.append(offset - salt_at)
-                    extra_lines.append(
-                        f"  HMAC 滑窗 salt={salt_hex[:16]}… 窗口={len(window)} 命中偏移={hits or '无'}"
-                    )
-                    for relative in hits:
-                        start = salt_at + relative
-                        blob = window[start : start + 32].hex()
-                        _validate_and_store_candidate(
-                            blob,
-                            validator,
-                            key_path,
-                            on_candidate,
-                            on_status,
-                            seen,
-                            candidates,
-                            validated_records,
-                        )
-                for value in stats.x32_values:
-                    extra_lines.append(f"  x'32hex={value} 是否已知salt={value in salts}")
-                    if value in salts:
-                        continue
-                    extra_lines.append("  未知 16 字节，按 passphrase 对每个库做 HMAC")
-                    import hashlib
-
-                    raw16 = bytes.fromhex(value)
-                    for salt_hex, page in pages_by_salt.items():
-                        salt = bytes.fromhex(salt_hex)
-                        derived = hashlib.pbkdf2_hmac("sha512", raw16, salt, 256000, dklen=32)
-                        matched = sqlcipher4_raw_key_matches(page, derived)
-                        extra_lines.append(f"    PBKDF2(raw16, {salt_hex[:8]}…) hmac={matched}")
-                        if matched:
-                            _validate_and_store_candidate(
-                                derived.hex(),
-                                validator,
-                                key_path,
-                                on_candidate,
-                                on_status,
-                                seen,
-                                candidates,
-                                validated_records,
-                            )
-                for salt_hex, follow in stats.salt_follow32:
-                    extra_lines.append(f"  salt hex后32字节 hmac salt={salt_hex[:16]}…")
-                    page = pages_by_salt.get(salt_hex)
-                    if page is None or len(follow) != 64:
-                        extra_lines.append("    跳过（没有页或长度不对）")
-                        continue
-                    matched = sqlcipher4_raw_key_matches(page, bytes.fromhex(follow))
-                    extra_lines.append(f"    follow32 hmac={matched}")
-                    if matched:
-                        _validate_and_store_candidate(
-                            follow,
-                            validator,
-                            key_path,
-                            on_candidate,
-                            on_status,
-                            seen,
-                            candidates,
-                            validated_records,
-                        )
-            if data_dirs:
-                extra_lines.append("  数据目录：" + "；".join(str(item) for item in data_dirs[:5]))
-            process_reports.append(format_memory_scan_report(stats))
-            ordered = [item.key_hex for item in memory_keys if item.salt_hex] + [
-                item.key_hex for item in memory_keys if not item.salt_hex
-            ]
-            for candidate in ordered:
-                _validate_and_store_candidate(
-                    candidate,
-                    validator,
-                    key_path,
-                    on_candidate,
-                    on_status,
-                    seen,
-                    candidates,
-                    validated_records,
-                )
-            if validated_records:
-                extra_lines.append(f"PID {process.pid} 已验证通过，停止后续探针")
-                break
-            extra_lines.append(
-                f"  salt 分区：私有堆 {stats.salt_binary_private}，映射文件 {stats.salt_binary_mapped}"
-            )
-            pages_by_salt: dict[str, bytes] = {}
-            for path in message_paths:
-                salt = read_sqlcipher_salt(path)
-                if salt is None:
-                    continue
-                try:
-                    pages_by_salt[salt.hex()] = path.read_bytes()[:4096]
-                except OSError:
-                    continue
-            if pages_by_salt and not validated_records:
-                brute_deadline = started + max(120, int(duration))
-                extra_lines.append(
-                    f"开始私有堆暴力 HMAC（对齐 16 字节，截止 {max(120, int(duration))} 秒）"
-                )
-
-                def brute_status(detail: str) -> None:
-                    remaining = max(0, int(brute_deadline - time.monotonic()))
-                    _notify(on_tick, remaining)
-                    _notify(on_status, detail)
-
-                brute_hits, brute_stats = hmac_brute_private_heap(
-                    process.pid,
-                    pages_by_salt,
-                    alignment=16,
-                    deadline=brute_deadline,
-                    on_status=brute_status,
-                    stop_event=stop_event,
-                )
-                extra_lines.append(
-                    f"  堆暴力：读 {brute_stats.get('bytes', 0)} 字节，窗口 {brute_stats.get('windows', 0)}，"
-                    f"实测 {brute_stats.get('tested', 0)}，命中 {len(brute_hits)}"
-                )
-                for salt_hex, key_hex in brute_hits:
-                    extra_lines.append(f"  堆暴力命中 salt={salt_hex[:16]}…")
-                    _validate_and_store_candidate(
-                        key_hex,
-                        validator,
-                        key_path,
-                        on_candidate,
-                        on_status,
-                        seen,
-                        candidates,
-                        validated_records,
-                    )
-        extra_lines.append(f"验证通过：{len(validated_records)} 个，候选：{len(candidates)} 个")
-        header = [
-            "=== Windows 密钥采集探针 ===",
-            *extra_lines,
-            "",
-            "--- 各进程明细 ---",
-        ]
-        report = "\n".join(header + process_reports)
-        log_path = _write_probe_report(key_path, report)
-        if log_path is not None:
-            report = report + f"\n完整日志：{log_path}"
-        if not validated_records:
-            if not find_sqlcipher_driver() and not find_sqlcipher_executable():
-                error = "未找到 SQLCipher，请先执行 python -m pip install -r requirements.txt"
-            elif not message_paths and not candidates:
-                error = "未找到 message_N.db，也未在内存中找到密钥串。请选择微信数据目录后重试。"
-            elif not candidates:
-                error = "内存中未出现 WCDB 密钥文本。请把界面里的探针报告发回来。"
-            elif not message_paths:
-                error = "已找到候选密钥，但未找到 message_N.db。请在第一步选择微信数据目录。"
-            else:
-                error = f"已扫描到 {len(candidates)} 个候选，但无法打开数据库。请把探针报告发回来。"
-    except WindowsProbeError as exc:
-        error = redact_output(str(exc))
-        report = report or error
-    except (OSError, KeyStoreError) as exc:
-        error = redact_output(str(exc))
-        report = report or error
-    except Exception as exc:
-        error = "密钥采集过程中发生未预期错误：" + redact_output(type(exc).__name__)
-        report = report or error
-    finally:
-        _notify(on_tick, 0)
-    elapsed = time.monotonic() - started
-    return CaptureResult(tuple(candidates), tuple(validated_records), elapsed, None, error, report)
 
 
 # 在指定微信 PID 上监听固定前缀的 key 行，并逐个调用验证器。
@@ -930,21 +556,6 @@ def _capture_keys_dtrace(
 
 # 返回采集前需要满足的环境条件，供界面展示。
 def get_capture_prerequisite() -> tuple[bool | None, str, str]:
-    if sys.platform == "win32":
-        from windows_memory_probe import is_current_user_admin, list_windows_wechat_processes
-
-        processes = list_windows_wechat_processes()
-        admin = is_current_user_admin()
-        if processes:
-            ok, detail = check_capture_probe(processes[0].pid)
-            if ok:
-                return True, "读取微信进程内存", "可进行内存密钥采集"
-            return False, "读取微信进程内存", detail
-        if admin is True:
-            return True, "管理员权限", "启动微信后可采集密钥"
-        if admin is False:
-            return False, "管理员权限", "若采集失败，请以管理员身份运行"
-        return None, "读取微信进程内存", "请启动并登录微信 4.x 后再采集"
     sip_disabled, detail = get_sip_status()
     if sip_disabled is True:
         return True, "关闭 macOS SIP", "可进行 DTrace 采集"
@@ -977,10 +588,6 @@ def get_sip_status() -> tuple[bool | None, str]:
 
 # 从 ps 输出中查找精确的微信主程序 PID，避免误匹配辅助进程。
 def find_wechat_pid(executable: Path | str | None = None) -> int | None:
-    if sys.platform == "win32":
-        from windows_memory_probe import find_windows_wechat_pid
-
-        return find_windows_wechat_pid()
     executable_text = str(executable or WECHAT_EXECUTABLE)
     try:
         completed = subprocess.run(
@@ -1007,10 +614,6 @@ def find_wechat_pid(executable: Path | str | None = None) -> int | None:
 
 # 读取微信 Info.plist 中的短版本号，读取失败时返回 None。
 def read_wechat_version(info_plist: Path | str | None = None) -> str | None:
-    if sys.platform == "win32":
-        from windows_memory_probe import find_windows_wechat_version
-
-        return find_windows_wechat_version()
     plist_path = Path(info_plist or WECHAT_INFO_PLIST)
     if not plist_path.exists():
         return None
@@ -1030,14 +633,6 @@ def detect_wechat(
     executable: Path | str | None = None,
     info_plist: Path | str | None = None,
 ) -> WeChatStatus:
-    if sys.platform == "win32":
-        from windows_memory_probe import list_windows_wechat_processes
-
-        processes = list_windows_wechat_processes()
-        if not processes:
-            return WeChatStatus(False, None, None, "Weixin.exe", "未检测到微信主进程")
-        current = processes[0]
-        return WeChatStatus(True, current.pid, current.version, current.executable, "已检测到微信主进程")
     target = Path(executable or WECHAT_EXECUTABLE)
     pid = find_wechat_pid(target)
     version = read_wechat_version(info_plist or WECHAT_INFO_PLIST)
@@ -1048,10 +643,6 @@ def detect_wechat(
 
 # 请求启动本机微信客户端。
 def launch_wechat() -> tuple[bool, str]:
-    if sys.platform == "win32":
-        from windows_memory_probe import launch_windows_wechat
-
-        return launch_windows_wechat()
     try:
         completed = subprocess.run(["open", "-a", "WeChat"], capture_output=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):

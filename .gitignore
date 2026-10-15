@@ -31,6 +31,7 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!wxwatch.spec
 
 # Installer logs
 pip-log.txt
@@ -208,6 +209,14 @@ tempCodeRunnerFile.py
 .venv/
 .DS_Store
 wechat_cccryptor_keys.json
+keys.json
+config.json
+mirror/
+decrypted/
+output/
+dist-linux/
+dist-win/
+.build/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

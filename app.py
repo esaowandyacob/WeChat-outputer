@@ -52,13 +52,8 @@ def _default_export_dir() -> Path:
     return Path.home() / "WeChatExport"
 
 
-# 第一步采集说明：macOS 需要关闭 SIP，Windows 需要可读进程内存。
+# 第一步采集说明：macOS 需要关闭 SIP 才能用 DTrace 取密钥。
 def _capture_hint_text() -> str:
-    if sys.platform == "win32":
-        return (
-            "请先启动并登录微信 4.x（进程名为 Weixin.exe）。采集会只读扫描当前用户的微信进程内存以寻找"
-            "数据库密钥，不会修改微信文件。若提示拒绝访问，请以管理员身份重新运行本工具。"
-        )
     return (
         "SIP 关闭说明：请在 macOS 恢复模式打开“终端”，执行 csrutil disable，重启后回到此页刷新。"
         "程序不会自动修改 SIP；完成采集后可自行重新启用。"
@@ -510,14 +505,10 @@ class WeChatExportApp(tk.Tk):
         capture_button = self.capture_row.winfo_children()[-1]
         if isinstance(capture_button, FlatButton):
             capture_button.set_enabled(False)
-        duration = 1200 if sys.platform == "win32" else 60
+        duration = 60
         self.capture_var.set(f"⏳ 启动密钥采集（剩余 {duration} 秒）")
         self._captured_masks = []
-        listening_hint = (
-            "正在跑完整内存探针（含堆 HMAC，可能 10–20 分钟），请保持微信已登录…"
-            if sys.platform == "win32"
-            else "正在监听，请在微信中登录并打开几个会话…"
-        )
+        listening_hint = "正在监听，请在微信中登录并打开几个会话…"
         self.captured_list_var.set(listening_hint)
 
         # 把采集倒计时安全地投递到 Tk 主线程。
@@ -734,6 +725,13 @@ class WeChatExportApp(tk.Tk):
 
 # 启动桌面应用主循环。
 def main() -> None:
+    if sys.platform != "darwin":
+        print(
+            "macOS 导出界面只在 Mac 上运行。\n"
+            "Linux / Windows 请运行：python main.py gui",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     app = WeChatExportApp()
     app.mainloop()
 

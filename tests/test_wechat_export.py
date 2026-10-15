@@ -28,28 +28,12 @@ from read_wechat_conversation import (
     WeChatReader,
     build_memory_model,
     decode_message_content,
-    default_wechat_data_roots,
     detect_sqlcipher_key_mode,
-    discover_message_databases,
     export_html,
     export_sqlite,
     export_text,
     find_sqlcipher_driver,
     open_database_backend,
-)
-from windows_key_hook import iter_hook_key_candidates
-from windows_memory_probe import (
-    MemoryScanStats,
-    ascii_x_hex_length_histogram,
-    collect_probe_string_hits,
-    collect_salt_hit_samples,
-    collect_x32_hex_values,
-    extract_data_dirs_from_bytes,
-    extract_hex_keys_from_bytes,
-    extract_key_candidates_from_bytes,
-    extract_keys_using_salts,
-    format_memory_scan_report,
-    normalize_windows_data_root,
 )
 
 
@@ -127,14 +111,6 @@ def test_key_store_is_private(tmp_path: Path) -> None:
     assert load_key_records(path)[0].hex == key
     if os.name != "nt":
         assert os.stat(path).st_mode & 0o777 == 0o600
-
-
-# 验证动态下断读到的缓冲区能切出 32 字节 raw key。
-def test_hook_key_candidates_from_buffer() -> None:
-    key = "ab" * 32
-    assert iter_hook_key_candidates(key, 32) == [key]
-    assert iter_hook_key_candidates(key + "cd" * 16, 48)[0] == key
-    assert iter_hook_key_candidates("zz") == []
 
 
 # 验证运行时已安装可用的 SQLCipher Python 驱动。
@@ -263,89 +239,6 @@ def test_default_key_path_is_platform_specific(tmp_path: Path) -> None:
     assert mac == tmp_path / "Library" / "Application Support" / "WeChatExport" / "wechat_cccryptor_keys.json"
     assert win == tmp_path / "AppData" / "Roaming" / "WeChatExport" / "wechat_cccryptor_keys.json"
     assert linux == tmp_path / ".config" / "WeChatExport" / "wechat_cccryptor_keys.json"
-
-
-# 验证 Windows 内存中的 ASCII / UTF-16 密钥文本都能提取为 32 字节 hex。
-def test_extract_hex_keys_from_memory_bytes() -> None:
-    key = "ab" * 32
-    salt = "cd" * 16
-    ascii_blob = b"noise x'" + key.encode("ascii") + b"' more"
-    assert extract_hex_keys_from_bytes(ascii_blob) == [key]
-    with_salt = b"x'" + key.encode("ascii") + salt.encode("ascii") + b"'"
-    assert extract_hex_keys_from_bytes(with_salt) == [key]
-    without_quote = b"x'" + key.encode("ascii") + b" trailing"
-    assert extract_hex_keys_from_bytes(without_quote) == [key]
-    candidates = extract_key_candidates_from_bytes(with_salt)
-    assert candidates[0].key_hex == key
-    assert candidates[0].salt_hex == salt
-    utf16_blob = ("prefix x'" + key + salt + "' suffix").encode("utf-16le")
-    utf16_candidates = extract_key_candidates_from_bytes(utf16_blob)
-    assert utf16_candidates[0].key_hex == key
-    assert utf16_candidates[0].salt_hex == salt
-    salt_bytes = bytes.fromhex(salt)
-    nearby = key.encode("ascii") + salt.encode("ascii")
-    found = extract_keys_using_salts(nearby, {salt: salt_bytes})
-    assert found[0].key_hex == key
-    assert found[0].salt_hex == salt
-    histogram = ascii_x_hex_length_histogram(b"x'" + (b"ab" * 32) + b"zz x'abcd")
-    assert histogram.get("64") == 1
-    assert histogram.get("1-15") == 1
-    salt = bytes.fromhex("cd" * 16)
-    blob = b"zzzz" + (b"\x11" * 32) + salt + (b"\x22" * 32)
-    samples = collect_salt_hit_samples(blob, {salt.hex(): salt})
-    assert samples[0][0] == "binary"
-    assert samples[0][2].endswith((b"\x11" * 32).hex())
-    assert samples[0][3].startswith((b"\x22" * 32).hex())
-    assert collect_x32_hex_values(b"x'" + (b"ab" * 16) + b"zz") == ["ab" * 16]
-    pragma_hits = collect_probe_string_hits(b"xxPRAGMA cipher_salt = x'aabb'yy")
-    assert any("cipher_salt" in item for item in pragma_hits)
-    from windows_memory_probe import count_token, collect_follow_bytes_after_salt_hex
-
-    assert count_token(b"sqlite3_key\x00abc", b"sqlite3_key") == 1
-    assert count_token(b"sqlite3_keyword_name", b"sqlite3_key") == 0
-    salt = "ab" * 16
-    follows = collect_follow_bytes_after_salt_hex(salt.encode() + b"'" + (b"\x33" * 32), {salt: bytes.fromhex(salt)})
-    assert follows[0][1] == (b"\x33" * 32).hex()
-
-
-# 验证探针报告包含可观察计数，不包含完整密钥。
-def test_memory_scan_report_is_readable() -> None:
-    stats = MemoryScanStats(python_bits=64, admin=True, pid=123, process_name="Weixin.exe", bytes_read=4096)
-    text = format_memory_scan_report(stats, ["message_N.db：2 个"])
-    assert "Python：64 位" in text
-    assert "PID 123" in text
-    assert "message_N.db：2 个" in text
-    assert "abababab" not in text
-
-
-# 验证 Windows 内存中的 xwechat_files 路径提取。
-def test_extract_data_dirs_from_memory_bytes() -> None:
-    path = r"C:\Users\me\Documents\xwechat_files\wxid_abc\db_storage"
-    ascii_hits = extract_data_dirs_from_bytes(b"xx" + path.encode("ascii") + b"yy")
-    utf16_hits = extract_data_dirs_from_bytes(path.encode("utf-16le"))
-    assert any("xwechat_files" in item and "wxid_abc" in item for item in ascii_hits)
-    assert any("xwechat_files" in item and "wxid_abc" in item for item in utf16_hits)
-
-
-# 验证微信文件管理路径会转换成 xwechat_files 根目录。
-def test_normalize_windows_data_root(tmp_path: Path) -> None:
-    documents = tmp_path / "Documents"
-    assert normalize_windows_data_root("MyDocument:", documents) == documents / "xwechat_files"
-    assert normalize_windows_data_root(str(tmp_path / "custom"), documents) == tmp_path / "custom" / "xwechat_files"
-    assert normalize_windows_data_root(str(tmp_path / "xwechat_files"), documents) == tmp_path / "xwechat_files"
-
-
-# 验证 Windows 4.x 文档目录布局可被自动发现。
-def test_discover_windows_message_databases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("read_wechat_conversation.sys.platform", "win32")
-    message_dir = tmp_path / "Documents" / "xwechat_files" / "wxid_me" / "db_storage" / "message"
-    message_dir.mkdir(parents=True)
-    database = message_dir / "message_0.db"
-    database.write_bytes(b"SQLite format 3\x00")
-    roots = default_wechat_data_roots(tmp_path)
-    assert tmp_path / "Documents" / "xwechat_files" in roots
-    found = discover_message_databases(home=tmp_path)
-    assert database.resolve() in found
 
 
 # 验证媒体模型可以独立承载音频二进制。

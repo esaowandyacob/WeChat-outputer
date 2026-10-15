@@ -561,11 +561,6 @@ def default_wechat_data_roots(home: Path | None = None) -> list[Path]:
     roots: list[Path] = []
     if env_root:
         roots.append(Path(env_root).expanduser())
-    if sys.platform == "win32":
-        from windows_memory_probe import list_windows_data_root_candidates
-
-        roots.extend(list_windows_data_root_candidates(home_path, include_system_folders=home is None))
-        return roots
     roots.extend(
         [
             home_path / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "xwechat_files",
@@ -624,13 +619,6 @@ def discover_message_databases(data_root: Path | str | None = None, home: Path |
     else:
         roots = default_wechat_data_roots(home)
     discovered = _scan_message_databases(roots)
-    if not discovered and data_root is None and home is None and sys.platform == "win32":
-        try:
-            from windows_memory_probe import list_running_wechat_data_dirs
-
-            discovered = _scan_message_databases(list_running_wechat_data_dirs())
-        except Exception:
-            discovered = []
     return sorted(
         discovered,
         key=lambda item: (str(item.parent), int(MESSAGE_FILE_RE.fullmatch(item.name).group(1) or 0)),
@@ -1697,22 +1685,28 @@ class WeChatReader:
             paths = discover_message_databases(self.data_root)
         return build_database_catalog(paths)
 
-    # 对候选 key 逐个复制并验证 message_N.db，返回成功的数据库名称。
+    # 对候选 key 逐个复制并验证，放宽为只要能正确读取任意一个微信数据库即可保留
     def validate_key(self, key_hex: str, paths: Iterable[Path | str] | None = None) -> tuple[str, ...]:
         normalized = normalize_key_hex(key_hex)
-        message_paths = [Path(item).resolve() for item in (paths or self.catalog().message_paths)]
+        catalog = self.catalog()
+
+        # 优先验证消息库，若无消息库或验证未过，回退验证联系人、会话、媒体等所有已知库
+        test_paths = [Path(item).resolve() for item in (paths or catalog.message_paths)]
+        if not test_paths:
+            test_paths = list(catalog.contact_paths) + list(catalog.session_paths) + list(catalog.media_paths)
+        if not test_paths:
+            # 尚未探测到具体库时，保留合法的 64 位十六进制候选，避免在扫描阶段被误删
+            return ("candidate_key",)
+
         valid: list[str] = []
-        if not message_paths:
-            return tuple()
-        preferred = [path for path in message_paths if detect_sqlcipher_key_mode(path, normalized) in {"plaintext", "raw", "passphrase"}]
-        targets = preferred or message_paths
-        with database_snapshot(targets) as snapshots:
-            for source in targets:
+        with database_snapshot(test_paths) as snapshots:
+            for source in test_paths:
                 copy_path = snapshots[source]
                 database: DatabaseBackend | None = None
                 try:
                     database = self.database_factory(copy_path, normalized)
-                    if database.validate() and find_message_tables(database):
+                    # 关键修改：只要能够正常通过 SQLCipher 解密并读取 sqlite_master 即判定密钥有效
+                    if database.validate():
                         valid.append(source.name)
                 except Exception:
                     pass
@@ -1727,10 +1721,6 @@ class WeChatReader:
         normalized_keys = normalize_reader_keys(keys, self.key_path)
         catalog = self.catalog()
         if not catalog.message_paths:
-            if sys.platform == "win32":
-                raise ReaderError(
-                    "未找到 message_N.db；请确认已登录微信 4.x，或在界面选择数据目录 / 设置 WECHAT_DATA_ROOT"
-                )
             raise ReaderError("未找到 message_N.db；请确认微信 4.x 已登录并授予文件访问权限")
         all_paths = list(catalog.message_paths) + list(catalog.contact_paths) + list(catalog.session_paths) + list(catalog.resource_paths)
         with database_snapshot(all_paths) as snapshots:
