@@ -1779,7 +1779,7 @@ def _browser_video_bytes(path: Path) -> bytes:
     from wxwatch.imagedat import _write_atomic
 
     # 转码结果按源文件路径、大小和修改时间缓存。再次导出同一会话时不用重新转码。
-    cache_dir = _media_cache_dir()
+    cache_dir = _active_media_cache_dir()
     try:
         stat = path.stat()
         cache_key = hashlib.sha256(f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()
@@ -1826,6 +1826,12 @@ def _media_cache_dir() -> Path:
     from cccryptor_probe import default_app_support_dir
 
     return default_app_support_dir() / "media_cache"
+
+
+# 当前导出使用的缓存目录。进程池的子进程从上下文取，和主进程保持一致。
+def _active_media_cache_dir() -> Path:
+    cache_dir = _MEDIA_CONTEXT.get("cache_dir")
+    return Path(cache_dir) if cache_dir else _media_cache_dir()
 
 
 # 媒体处理基本都在等 ffmpeg 子进程或网络，用线程并行。
