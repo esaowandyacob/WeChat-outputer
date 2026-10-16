@@ -130,6 +130,7 @@ class DatabaseCatalog:
     session_paths: tuple[Path, ...]
     account_root: Path | None = None
     resource_paths: tuple[Path, ...] = ()
+    emoticon_paths: tuple[Path, ...] = ()
 
 
 class DatabaseBackend(Protocol):
@@ -386,7 +387,10 @@ class SQLCipherCLIBackend:
             ".bail on\n"
             ".mode json\n"
             ".headers on\n"
+            # PRAGMA key 会输出 [{"ok":"ok"}]。查询结果为空时它会被当成结果行，所以丢掉 pragma 的输出。
+            ".output /dev/null\n"
             f"{pragmas}\n"
+            ".output stdout\n"
             f"{query};\n"
             ".quit\n"
         ).encode("utf-8")
@@ -645,6 +649,7 @@ def build_database_catalog(message_paths: Iterable[Path | str]) -> DatabaseCatal
     contacts: set[Path] = set()
     sessions: set[Path] = set()
     resources: set[Path] = set()
+    emoticons: set[Path] = set()
     for root in search_roots:
         for relative in (Path("message") / "media_0.db", Path("message") / "media_1.db", Path("media_0.db")):
             candidate = root / relative
@@ -666,6 +671,9 @@ def build_database_catalog(message_paths: Iterable[Path | str]) -> DatabaseCatal
             candidate = root / relative
             if candidate.is_file():
                 resources.add(candidate.resolve())
+        candidate = root / "emoticon" / "emoticon.db"
+        if candidate.is_file():
+            emoticons.add(candidate.resolve())
     # 兼容多个 media_N.db，仍只接受明确的 media_N 命名。
     for candidate in db_storage.rglob("media_*.db") if db_storage.is_dir() else []:
         if re.fullmatch(r"media_\d+\.db", candidate.name, re.IGNORECASE):
@@ -677,6 +685,7 @@ def build_database_catalog(message_paths: Iterable[Path | str]) -> DatabaseCatal
         tuple(sorted(sessions)),
         account_root,
         tuple(sorted(resources)),
+        tuple(sorted(emoticons)),
     )
 
 
@@ -932,6 +941,54 @@ def parse_message_xml(content: str) -> dict[str, str]:
     return {key: value for key, value in values.items() if value}
 
 
+# 去掉标签和 CDATA 包装，只留下可读文字。
+def _strip_markup(text: str) -> str:
+    text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", text, flags=re.S)
+    text = re.sub(r"<[^>]*>", "", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# 系统消息转成纯文字：展开 sysmsgtemplate 的 $name$ 占位符，去掉 <_wc_custom_link_> 等标签。
+def system_message_text(content: str) -> str:
+    text = str(content or "")
+    if "&lt;" in text and "<" not in text:
+        text = html.unescape(text)
+    # 群里的系统消息正文前面带 “xxx@chatroom:\n”。
+    prefixed = re.match(r"^[A-Za-z0-9_.@-]{2,128}:\s*\n(?=\s*<)", text)
+    if prefixed:
+        text = text[prefixed.end():]
+    start = text.find("<sysmsg")
+    if start >= 0:
+        end = text.rfind("</sysmsg>")
+        xml = text[start:end + len("</sysmsg>")] if end > start else text[start:]
+        try:
+            root = ElementTree.fromstring(xml)
+        except ElementTree.ParseError:
+            root = None
+        if root is not None:
+            template = root.find(".//content_template")
+            if template is not None:
+                body = template.findtext("template") or template.findtext("plain") or ""
+                for link in template.iter("link"):
+                    name = link.get("name") or ""
+                    nicknames = [
+                        (member.findtext("nickname") or member.findtext("username") or "").strip()
+                        for member in link.iter("member")
+                    ]
+                    value = "、".join(item for item in nicknames if item) or (link.findtext(".//plain") or "").strip()
+                    body = body.replace(f"${name}$", value)
+                return _strip_markup(body)
+            for path in (".//revokemsg/replacemsg", ".//revokemsg", ".//template", ".//text", ".//content"):
+                found = root.find(path)
+                if found is not None:
+                    value = _strip_markup("".join(found.itertext()))
+                    if value:
+                        return value
+            return _strip_markup("".join(root.itertext()))
+    return _strip_markup(text)
+
+
 # 从正文前缀中提取稳定 wxid，并移除“wxid:\n”包装。
 def extract_sender_prefix(content: str) -> tuple[str | None, str]:
     content = str(content or "")
@@ -944,7 +1001,52 @@ def extract_sender_prefix(content: str) -> tuple[str | None, str]:
     return candidate, match.group(2)
 
 
-# 依据用户明确的标题优先级生成昵称：群名/昵称/别名/wxid，不优先使用备注。
+# 读取联系人字段里的第一段非空文本。
+def _contact_text(row: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = row_value(row, key, default="")
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            value = bytes(value).decode("utf-8", errors="replace")
+        text = str(value).replace("\x00", "").strip()
+        if text:
+            return text
+    return ""
+
+
+# 账号目录名 wxid_xxx_a9d3 和库里的 wxid_xxx 是同一个人。
+def owner_aliases(self_wxid: str) -> set[str]:
+    owner = str(self_wxid or "")
+    aliases: set[str] = set()
+    if not owner or owner == "self":
+        if owner == "self":
+            aliases.add("self")
+        return aliases
+    aliases.add(owner)
+    short, separator, tail = owner.rpartition("_")
+    if separator and short.startswith("wxid_") and re.fullmatch(r"[0-9a-fA-F]{4}", tail):
+        aliases.add(short)
+    return aliases
+
+
+# 判断一个 wxid 是不是当前导出账号自己。
+def is_account_owner(wxid: str, self_wxid: str = "") -> bool:
+    value = str(wxid or "")
+    if not value:
+        return False
+    if value == "self" and (not self_wxid or self_wxid == "self"):
+        return True
+    return value in owner_aliases(self_wxid)
+
+
+# 在原名后面附上备注。没有备注或备注与原名相同时保持原名。
+def _with_remark(base: str, contact: Mapping[str, Any], group: Mapping[str, Any]) -> str:
+    remark = _contact_text(contact, "remark") or _contact_text(group, "remark")
+    if remark and remark != base:
+        return f"{base}（{remark}）"
+    return base
+
+
+# 生成会话和发送者的显示名：群名或昵称在前，备注放在括号里。
 def preferred_display_name(
     wxid: str,
     contact: Mapping[str, Any] | None = None,
@@ -965,18 +1067,14 @@ def preferred_display_name(
             "nickname",
             "name",
         ):
-            value = row_value(group, key, default="") or row_value(contact, key, default="")
-            if isinstance(value, (bytes, bytearray, memoryview)):
-                value = bytes(value).decode("utf-8", errors="replace")
-            if str(value).strip():
-                return str(value).strip()
+            base = _contact_text(group, key) or _contact_text(contact, key)
+            if base:
+                return _with_remark(base, contact, group)
     for key in ("nick_name", "alias", "nickname", "display_name", "displayname"):
-        value = row_value(contact, key, default="")
-        if isinstance(value, (bytes, bytearray, memoryview)):
-            value = bytes(value).decode("utf-8", errors="replace")
-        if str(value).strip():
-            return str(value).strip()
-    return wxid or "未知用户"
+        base = _contact_text(contact, key)
+        if base:
+            return _with_remark(base, contact, group)
+    return _with_remark(wxid or "未知用户", contact, group)
 
 
 # 过滤明显的公众号、服务通知和系统会话，保留普通单聊与群聊。
@@ -1013,6 +1111,8 @@ def classify_message(
     xml_values: Mapping[str, str],
 ) -> tuple[str, str | None, str | None, str | None, str | None]:
     lowered = content.casefold()
+    if "<emoji" in lowered or message_type in {47, 8_000_000} or "[表情]" in content:
+        return "[表情]", None, None, None, None
     link_url = xml_values.get("url") or None
     link_title = xml_values.get("title") or None
     link_description = xml_values.get("description") or None
@@ -1043,7 +1143,7 @@ def classify_message(
             return link_title or "[链接]", link_url, link_title, link_description, link_source
         return "[应用消息]", link_url, link_title, link_description, link_source
     if message_type in {10000, 10002, 51} or "撤回" in content or "<sysmsg" in lowered or "revokemsg" in lowered:
-        system_content = xml_values.get("system") or content
+        system_content = system_message_text(content)
         return f"[系统消息] {system_content}" if system_content else "[系统消息]", None, None, None, None
     if content:
         return content, link_url, link_title, link_description, link_source
@@ -1179,15 +1279,19 @@ def find_voice_data(
                     identifier = decode_message_content(row_value(row, "__name_id", default=""))
                     if identifier:
                         wanted_chat_ids.add(identifier)
+    # 不能把 local_id、server_id、会话 id 用 OR 拼在一起，否则别的消息的语音会贴到这条上。
     conditions: list[str] = []
-    if local_column and local_id:
-        conditions.append(f"{sql_identifier(local_column)} = {sql_literal(local_id)}")
-    if server_column and wanted_server:
+    if server_column and wanted_server not in {"", "0", "None"}:
         conditions.append(f"{sql_identifier(server_column)} = {sql_literal(wanted_server)}")
-    if chat_column and wanted_chat_ids:
-        conditions.append(
-            "(" + " OR ".join(f"{sql_identifier(chat_column)} = {sql_literal(item)}" for item in wanted_chat_ids) + ")"
-        )
+    elif local_column and local_id:
+        local_match = f"{sql_identifier(local_column)} = {sql_literal(local_id)}"
+        if chat_column and wanted_chat_ids:
+            chat_match = "(" + " OR ".join(
+                f"{sql_identifier(chat_column)} = {sql_literal(item)}" for item in wanted_chat_ids
+            ) + ")"
+            conditions.append(f"{local_match} AND {chat_match}")
+        else:
+            conditions.append(local_match)
     if not conditions:
         return None
     select_parts = [f"hex({sql_identifier(data_column)}) AS __voice_hex"]
@@ -1354,6 +1458,69 @@ def load_session_records(backends: Iterable[DatabaseBackend]) -> list[dict[str, 
     return result
 
 
+# 从消息库 Name2Id 建立 md5(用户名) 到 wxid 的映射，用来给 Msg_<md5> 表恢复会话身份。
+def load_name2id_usernames(backends: Iterable[DatabaseBackend]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for database in backends:
+        try:
+            names = table_names(database)
+        except DatabaseQueryError:
+            continue
+        for table in names:
+            if normalized_field_name(table) != "name2id":
+                continue
+            try:
+                columns = table_columns(database, table)
+            except DatabaseQueryError:
+                continue
+            username_column = choose_column(columns, ("user_name", "username", "usrname", "name"))
+            if not username_column:
+                continue
+            try:
+                rows = database.query(
+                    f"SELECT {sql_identifier(username_column)} AS __user_name FROM {sql_identifier(table)}"
+                )
+            except DatabaseQueryError:
+                continue
+            for row in rows:
+                username = text_value(row_value(row, "__user_name", default=""))
+                if not username:
+                    continue
+                digest = hashlib.md5(username.encode("utf-8")).hexdigest().casefold()
+                mapping.setdefault(digest, username)
+    return mapping
+
+
+# 读取单个消息库里的 Name2Id：rowid 只在这个库内表示发送者。
+def load_name2id_by_rowid(database: DatabaseBackend) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    try:
+        names = table_names(database)
+    except DatabaseQueryError:
+        return mapping
+    for table in names:
+        if normalized_field_name(table) != "name2id":
+            continue
+        try:
+            columns = table_columns(database, table)
+            username_column = choose_column(columns, ("user_name", "username", "usrname", "name"))
+            if not username_column:
+                continue
+            rows = database.query(
+                f"SELECT rowid AS __rowid, {sql_identifier(username_column)} AS __user_name FROM {sql_identifier(table)}"
+            )
+        except DatabaseQueryError:
+            continue
+        for row in rows:
+            try:
+                number = int(row.get("__rowid"))
+            except (TypeError, ValueError):
+                continue
+            # 空名字也要记下：这个编号属于本库，不能再拿别的库同号的人顶上。
+            mapping[number] = text_value(row.get("__user_name"))
+    return mapping
+
+
 # 从消息资源库的 SenderName2Id 表构建内部 sender id 到 wxid 的映射。
 def load_sender_resource_map(backends: Iterable[DatabaseBackend]) -> dict[int, str]:
     mapping: dict[int, str] = {}
@@ -1507,7 +1674,7 @@ def parse_message_row(
     if not decoded:
         fallback_content = row_value(row, "compress_content", "compressed_content", "content_blob", default="")
         decoded = decode_message_content(fallback_content, compression)
-    prefix_wxid, clean_content = extract_sender_prefix(decoded)
+    prefix_wxid, stripped_content = extract_sender_prefix(decoded)
     raw_sender = row_value(
         row,
         "sender_wxid",
@@ -1521,23 +1688,42 @@ def parse_message_row(
         default="",
     )
     sender_wxid = decode_message_content(raw_sender).strip()
-    if prefix_wxid:
-        sender_wxid = prefix_wxid
-    if not sender_wxid or sender_wxid.isdigit():
-        internal_sender = integer_id(row_value(row, "real_sender_id", "sender_id", "from_id", default=0), 0)
-        if internal_sender == 2:
+    internal_sender = integer_id(row_value(row, "real_sender_id", "sender_id", "from_id", default=0), 0)
+    # 每个 message_N.db 的 Name2Id 行号互不通用，必须以当前库为准。
+    # 正文开头的“xxx:”经常只是聊天文字，不能盖过这个映射。
+    mapped_sender = sender_resource.get(internal_sender) if internal_sender else None
+    # Name2Id 里有的行名字是空的。视频、表情等 XML 带 fromusername，可以补上发送人。
+    xml_sender = re.search(r"\bfromusername\s*=\s*[\"']([^\"']+)[\"']|<fromusername>(?:<!\[CDATA\[)?([^<\]]+)", decoded)
+    from_wxid = (xml_sender.group(1) or xml_sender.group(2)).strip() if xml_sender else ""
+    if from_wxid.casefold().endswith("@chatroom"):
+        from_wxid = ""
+    if mapped_sender:
+        sender_wxid = mapped_sender
+    elif not sender_wxid or sender_wxid.isdigit():
+        if prefix_wxid:
+            sender_wxid = prefix_wxid
+        elif from_wxid:
+            sender_wxid = from_wxid
+        elif internal_sender == 2 and self_wxid and self_wxid != "self":
             sender_wxid = self_wxid
-        elif internal_sender in sender_resource:
-            sender_wxid = sender_resource[internal_sender]
         elif conversation_id.casefold().endswith("@chatroom"):
             sender_wxid = f"unknown_sender_{internal_sender}" if internal_sender else "unknown_sender"
         else:
             sender_wxid = conversation_id
+    clean_content = stripped_content if prefix_wxid and prefix_wxid == sender_wxid else decoded
     xml_values = parse_message_xml(clean_content)
     if not clean_content:
         clean_content = decoded
     content, link_url, link_title, link_description, link_source = classify_message(message_type, clean_content, xml_values)
-    if link_url is None:
+    if content.startswith("[系统消息]"):
+        # 拍一拍用 ${wxid}、领红包用 $wxid$ 指代成员。
+        def member_name(match: re.Match[str]) -> str:
+            wxid = match.group(1) or match.group(2)
+            return preferred_display_name(wxid, contacts.get(wxid))
+
+        content = re.sub(r"\$\{([^}]+)\}|\$(wxid_[A-Za-z0-9_-]+|[A-Za-z0-9_.-]+@chatroom)\$", member_name, content)
+    # 只有纯文本消息才从正文里找链接。表情、图片等 XML 里的 cdnurl 不是用户发的链接。
+    if link_url is None and content == clean_content:
         direct_url = re.search(r"https?://[^\s<>]+", clean_content, re.I)
         if direct_url:
             link_url = direct_url.group(0).rstrip("。，,；;）)>")
@@ -1552,8 +1738,14 @@ def parse_message_row(
     if quote_content:
         quote_content = decode_message_content(quote_content)
     sender_name = preferred_display_name(sender_wxid, contacts.get(sender_wxid))
-    if sender_wxid == self_wxid and self_wxid == "self":
+    if content.startswith("[系统消息]") and (
+        sender_wxid.startswith("unknown_sender") or sender_wxid.casefold().endswith("@chatroom")
+    ):
+        sender_name = "系统"
+    if is_account_owner(sender_wxid, self_wxid):
         sender_name = "我"
+    if quote_wxid and is_account_owner(quote_wxid, self_wxid):
+        quote_name = "我"
     return MessageRecord(
         local_id=local_id,
         server_id=server_id,
@@ -1573,6 +1765,100 @@ def parse_message_row(
     )
 
 
+# 浏览器播不了 HEVC。这种视频在页面里只会出声音，转成 H.264 后画面才看得到。
+def _browser_video_bytes(path: Path) -> bytes:
+    original = path.read_bytes()
+    if path.suffix.casefold() != ".mp4":
+        return original
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        return original
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    codec = probe.stdout.strip().lower()
+    if codec in {"", "h264"}:
+        return original
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+        target = Path(handle.name)
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-y", "-i", str(path), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(target)],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0 or not target.is_file():
+            return original
+        return target.read_bytes()
+    finally:
+        target.unlink(missing_ok=True)
+
+
+_IMAGE_KEY_DERIVED: set[str] = set()
+
+
+# 媒体文件所在的微信账号目录，即包含 db_storage 的那一层。
+def _account_root_of(path: Path) -> Path | None:
+    for parent in path.parents:
+        if (parent / "db_storage").is_dir():
+            return parent
+    return None
+
+
+# 尝试把微信 .dat 解成图片。没有 V2 密钥时返回 None，调用方仍导出原始文件。
+def _decode_wechat_dat(path: Path) -> bytes | None:
+    try:
+        from wxwatch.imagedat import decode_dat, load_image_keys
+    except Exception:
+        return None
+    config_path = Path(__file__).resolve().parent / "config.json"
+    image_key, xor_key = load_image_keys(config_path)
+    try:
+        decoded = decode_dat(path, image_key, xor_key)
+    except Exception:
+        decoded = None
+    if decoded is not None or sys.platform != "darwin":
+        return decoded
+    # macOS 的图片密钥可以从本机微信配置推导。密钥缺失或换了账号时推导一次并写回 config.json。
+    account_root = _account_root_of(path)
+    if account_root is None or str(account_root) in _IMAGE_KEY_DERIVED:
+        return None
+    _IMAGE_KEY_DERIVED.add(str(account_root))
+    try:
+        from wxwatch.imagekey import ensure_image_key_macos
+
+        if not ensure_image_key_macos(account_root):
+            return None
+        image_key, xor_key = load_image_keys(config_path)
+        return decode_dat(path, image_key, xor_key)
+    except Exception:
+        return None
+
+
+# macOS 单个路径分量最长 255 字节，整条路径最长 1024 字节。超限时 stat 会抛 Errno 63。
+def _filesystem_path_ok(path: Path) -> bool:
+    try:
+        if len(os.fsencode(path)) >= 1024:
+            return False
+        return all(len(os.fsencode(part)) <= 255 for part in path.parts)
+    except UnicodeEncodeError:
+        return False
+
+
+# 解出消息行的正文。CLI 后端把 BLOB 正文放在 __hex_message_content 里。
+def _row_content(row: Mapping[str, Any]) -> str:
+    raw_content = row_value(row, "message_content", "Message", "content", "text", default="")
+    raw_hex = str(row_value(row, "__hex_message_content", default="") or "")
+    if raw_hex and len(raw_hex) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", raw_hex):
+        with contextlib.suppress(ValueError):
+            raw_content = bytes.fromhex(raw_hex)
+    return decode_message_content(raw_content, row_value(row, "WCDB_CT_message_content", "compress_type", default=None))
+
+
 # 从原始消息行中查找可能存在的本地媒体路径，并限制在账号目录内。
 def local_media_path(row: Mapping[str, Any], account_root: Path | None) -> Path | None:
     if account_root is None:
@@ -1580,36 +1866,374 @@ def local_media_path(row: Mapping[str, Any], account_root: Path | None) -> Path 
     raw = row_value(row, "media_path", "path", "file_path", "attach_path", "image_path", "video_path", default="")
     raw = text_value(raw)
     if not raw:
-        raw_content = row_value(row, "message_content", "Message", "content", "text", default="")
-        raw_hex = str(row_value(row, "__hex_message_content", default="") or "")
-        if raw_hex and len(raw_hex) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", raw_hex):
-            with contextlib.suppress(ValueError):
-                raw_content = bytes.fromhex(raw_hex)
-        content = decode_message_content(raw_content)
+        content = _row_content(row)
         # 某些版本只在 appmsg/image XML 属性中留下本地附件相对路径。
-        match = re.search(r"(?:path|src|thumb|filepath|attachurl)=[\"']([^\"']+)[\"']", content, re.IGNORECASE)
+        # cdnthumburl 是 CDN 标识，不是本地文件名，拼到账号目录上会超过系统路径长度。
+        match = re.search(r"(?:filepath|attachurl|path|src)=[\"']([^\"']+)[\"']", content, re.IGNORECASE)
         if match:
             raw = match.group(1)
         else:
             tag_match = re.search(
-                r"<(?:path|src|filepath|attachurl|cdnthumburl|cdnthumbpath)>([^<]+)</(?:path|src|filepath|attachurl|cdnthumburl|cdnthumbpath)>",
+                r"<(?:filepath|attachurl|path|src)>([^<]+)</(?:filepath|attachurl|path|src)>",
                 content,
                 re.IGNORECASE,
             )
             if tag_match:
                 raw = tag_match.group(1)
         raw = text_value(raw)
-    if not raw:
+    if not raw or raw.startswith(("http://", "https://")):
         return None
     candidate = Path(str(raw)).expanduser()
     if not candidate.is_absolute():
         candidate = account_root / candidate
+    if not _filesystem_path_ok(candidate):
+        return None
     try:
         resolved = candidate.resolve()
         resolved.relative_to(account_root.resolve())
+        if not resolved.is_file():
+            return None
     except (OSError, ValueError):
         return None
-    return resolved if resolved.is_file() else None
+    return resolved
+
+
+_CACHED_MEDIA_BY_ROOT: dict[str, dict[str, Path]] = {}
+
+
+# 只有真实图片、视频，或可解密的 .dat 才挂到消息上。
+def _displayable_media_file(path: Path) -> bool:
+    try:
+        head = path.read_bytes()[:16]
+    except OSError:
+        return False
+    if head.startswith((b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"RIFF")):
+        return True
+    if head[:6] in {b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07"}:
+        return True
+    return path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov"}
+
+
+# 按文件名主干索引 cache 里的表情和已解码图片，避免每条消息都扫一遍目录。
+def _cached_media_by_stem(account_root: Path) -> dict[str, Path]:
+    key = str(account_root)
+    cached = _CACHED_MEDIA_BY_ROOT.get(key)
+    if cached is not None:
+        return cached
+    index: dict[str, Path] = {}
+    rank = {".jpg": 0, ".jpeg": 0, ".png": 0, ".gif": 0, ".webp": 0, "": 1, ".dat": 2}
+    cache = account_root / "cache"
+    if cache.is_dir():
+        for path in cache.rglob("*"):
+            if not path.is_file():
+                continue
+            stem = path.stem.lower()
+            current = index.get(stem)
+            path_rank = rank.get(path.suffix.lower(), 9)
+            current_rank = rank.get(current.suffix.lower(), 9) if current is not None else 99
+            if current is None or path_rank < current_rank:
+                index[stem] = path
+    _CACHED_MEDIA_BY_ROOT[key] = index
+    return index
+
+
+# 读取 emoticon.db 的收藏表情表：md5 -> 下载地址。商店表情只有本地加密包，没有地址。
+def load_emoticon_index(backends: Iterable[DatabaseBackend]) -> dict[str, dict[str, str]]:
+    index: dict[str, dict[str, str]] = {}
+    for database in backends:
+        if "kNonStoreEmoticonTable" not in table_names(database):
+            continue
+        try:
+            rows = database.query("SELECT md5, cdn_url, encrypt_url, aes_key FROM kNonStoreEmoticonTable")
+        except DatabaseQueryError:
+            continue
+        for row in rows:
+            md5_hex = text_value(row_value(row, "md5")).casefold()
+            if not re.fullmatch(r"[0-9a-f]{32}", md5_hex):
+                continue
+            index[md5_hex] = {
+                "cdnurl": text_value(row_value(row, "cdn_url")),
+                "encrypturl": text_value(row_value(row, "encrypt_url")),
+                "aeskey": text_value(row_value(row, "aes_key")),
+            }
+    return index
+
+
+# 商店表情没有下载地址。md5 -> 所在安装包、解密后的偏移和长度。
+def load_store_emoticon_index(backends: Iterable[DatabaseBackend]) -> dict[str, dict[str, int | str]]:
+    index: dict[str, dict[str, int | str]] = {}
+    for database in backends:
+        if "kStoreEmoticonFilesTable" not in table_names(database):
+            continue
+        try:
+            rows = database.query(
+                "SELECT md5_, package_id_, emoticon_offset_, emoticon_size_ FROM kStoreEmoticonFilesTable"
+            )
+        except DatabaseQueryError:
+            continue
+        for row in rows:
+            md5_hex = text_value(row_value(row, "md5_")).casefold()
+            package_id = text_value(row_value(row, "package_id_"))
+            if not re.fullmatch(r"[0-9a-f]{32}", md5_hex) or not package_id:
+                continue
+            index[md5_hex] = {
+                "package_id": package_id,
+                "offset": integer_id(row_value(row, "emoticon_offset_"), 0),
+                "size": integer_id(row_value(row, "emoticon_size_"), 0),
+            }
+    return index
+
+
+# 安装包是整文件 AES。表里的偏移指向解密并去掉填充之后的字节。
+def decrypt_emoticon_package(data: bytes, key: bytes) -> bytes | None:
+    if len(key) not in {16, 24, 32} or len(data) < 16 or len(data) % 16:
+        return None
+    from Crypto.Cipher import AES
+    from Crypto.Util import Padding
+
+    modes = [
+        AES.new(key, AES.MODE_ECB),
+        AES.new(key, AES.MODE_CBC, iv=key[:16]),
+        AES.new(key, AES.MODE_CBC, iv=b"\x00" * 16),
+    ]
+    for cipher in modes:
+        try:
+            decrypted = cipher.decrypt(data)
+        except ValueError:
+            continue
+        candidates = [decrypted]
+        try:
+            candidates.insert(0, Padding.unpad(decrypted, 16))
+        except ValueError:
+            pass
+        for plain in candidates:
+            if any(magic in plain[:64] for magic in _EMOJI_MAGICS):
+                return plain
+    return None
+
+
+def _emoticon_key() -> bytes | None:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8")).get("emoticon_key")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9a-fA-F]{32,64}", raw):
+        return None
+    return bytes.fromhex(raw)
+
+
+_STORE_PACKAGE_PLAIN: dict[str, bytes] = {}
+
+
+# 从商店表情安装包里切出一张表情。密钥还没采到时返回 None。
+def extract_store_emoji(
+    account_root: Path,
+    md5_hex: str,
+    store_index: Mapping[str, Mapping[str, int | str]] | None,
+) -> Path | None:
+    record = (store_index or {}).get(md5_hex)
+    key = _emoticon_key()
+    if record is None or key is None:
+        return None
+    package_id = str(record["package_id"])
+    offset = int(record["offset"])
+    size = int(record["size"])
+    if size <= 0 or offset < 0:
+        return None
+    plain = _STORE_PACKAGE_PLAIN.get(package_id)
+    if plain is None:
+        digest = hashlib.md5(package_id.encode("utf-8")).hexdigest()
+        package_path = next(
+            ((account_root / "business" / "emoticon" / "PersistStore").rglob(digest)),
+            None,
+        )
+        if package_path is None or not package_path.is_file():
+            return None
+        try:
+            plain = decrypt_emoticon_package(package_path.read_bytes(), key)
+        except OSError:
+            return None
+        if plain is None:
+            return None
+        _STORE_PACKAGE_PLAIN[package_id] = plain
+    blob = plain[offset:offset + size]
+    if not blob.startswith(_EMOJI_MAGICS):
+        return None
+    cache_dir = _emoji_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    extension = ".gif" if blob.startswith(b"GIF8") else ".png" if blob.startswith(b"\x89PNG") else ".webp" if blob.startswith(b"RIFF") else ".jpg"
+    target = cache_dir / f"{md5_hex}{extension}"
+    target.write_bytes(blob)
+    (cache_dir / f"{md5_hex}.miss").unlink(missing_ok=True)
+    return target
+
+
+# 只从微信自己的 CDN 下载表情。消息 XML 来自聊天对方，不能按里面的任意地址发请求。
+_EMOJI_HOST_SUFFIXES = (".qq.com", ".qpic.cn", ".wechat.com")
+_EMOJI_MAGICS = (b"GIF8", b"\x89PNG", b"\xff\xd8\xff", b"RIFF", b"wxgf")
+
+
+def _emoji_url_allowed(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    return parsed.scheme in {"http", "https"} and any(host == item[1:] or host.endswith(item) for item in _EMOJI_HOST_SUFFIXES)
+
+
+def _emoji_cache_dir() -> Path:
+    from cccryptor_probe import default_app_support_dir
+
+    return default_app_support_dir() / "emoji_cache"
+
+
+# 本地表情缓存是另一把未公开的密钥加密的。用消息 XML 里的 cdnurl / encrypturl 取原图，按 md5 缓存到本机。
+# XML 里没有地址时，用 emoticon.db 里同 md5 的记录补上（fallback 的键与 XML 属性同名）。
+def fetch_emoji(content: str, md5_hex: str, fallback: Mapping[str, str] | None = None) -> Path | None:
+    if os.environ.get("WECHAT_EXPORT_OFFLINE") or not re.fullmatch(r"[0-9a-f]{32}", md5_hex):
+        return None
+    cache_dir = _emoji_cache_dir()
+    missed = False
+    for cached in cache_dir.glob(f"{md5_hex}.*"):
+        if cached.suffix != ".miss":
+            return cached
+        missed = True
+    # 之前失败过、这次也没有新的地址来源时不再请求。
+    if missed and not fallback:
+        return None
+    start = content.find("<emoji")
+    attrs = {
+        key.casefold(): html.unescape(value)
+        for key, value in re.findall(r"(\w+)\s*=\s*\"([^\"]*)\"", content[start:start + 8000])
+    } if start >= 0 else {}
+    for key, value in (fallback or {}).items():
+        if value and not attrs.get(key):
+            attrs[key] = value
+    import urllib.request
+
+    data: bytes | None = None
+    aes_key = attrs.get("aeskey", "")
+    sources = [(attrs.get("cdnurl", ""), None)]
+    if re.fullmatch(r"[0-9a-fA-F]{32}", aes_key):
+        sources.append((attrs.get("encrypturl", ""), bytes.fromhex(aes_key)))
+    for url, key in sources:
+        if not url or not _emoji_url_allowed(url):
+            continue
+        try:
+            with urllib.request.urlopen(url, timeout=15) as response:
+                payload = response.read(20 * 1024 * 1024)
+        except Exception:
+            continue
+        if key is not None:
+            try:
+                from Crypto.Cipher import AES
+                from Crypto.Util import Padding
+
+                payload = Padding.unpad(AES.new(key, AES.MODE_CBC, key).decrypt(payload), 16)
+            except Exception:
+                continue
+        if payload.startswith(b"wxgf"):
+            from wxwatch.imagedat import wxgf_to_jpeg
+
+            payload = wxgf_to_jpeg(payload) or b""
+        if payload.startswith(_EMOJI_MAGICS):
+            data = payload
+            break
+    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if data is None:
+        # 记下失败，重复导出时不再请求同一个表情。
+        (cache_dir / f"{md5_hex}.miss").touch()
+        return None
+    (cache_dir / f"{md5_hex}.miss").unlink(missing_ok=True)
+    extension = ".gif" if data.startswith(b"GIF8") else ".png" if data.startswith(b"\x89PNG") else ".webp" if data.startswith(b"RIFF") else ".jpg"
+    target = cache_dir / f"{md5_hex}{extension}"
+    target.write_bytes(data)
+    return target
+
+
+# 从 packed_info 或消息 XML 中取出 32 位媒体 md5。
+def _packed_media_md5(row: Mapping[str, Any]) -> str:
+    packed = row_value(row, "packed_info_data", default=b"")
+    if isinstance(packed, memoryview):
+        packed = packed.tobytes()
+    if isinstance(packed, str):
+        packed = packed.encode("utf-8", errors="ignore")
+    if isinstance(packed, (bytes, bytearray)):
+        match = re.search(rb"[0-9a-f]{32}", bytes(packed))
+        if match:
+            return match.group(0).decode("ascii")
+    content = _row_content(row)
+    xml_match = re.search(r"\bmd5=[\"']([0-9a-fA-F]{32})[\"']", content)
+    return xml_match.group(1).lower() if xml_match else ""
+
+
+# 按微信 4.x 的目录规则定位已经落盘的图片、视频和文件。
+def local_media_files(
+    row: Mapping[str, Any],
+    account_root: Path | None,
+    conversation_id: str,
+    emoji_index: Mapping[str, Mapping[str, str]] | None = None,
+    store_index: Mapping[str, Mapping[str, int | str]] | None = None,
+) -> list[Path]:
+    found: list[Path] = []
+    if account_root is None:
+        return found
+    md5_hex = _packed_media_md5(row)
+    created = timestamp_seconds(row_value(row, "create_time", "CreateTime", "timestamp", default=0))
+    base_type = integer_id(row_value(row, "local_type", "type", "message_type", default=0), 0) & 0xFFFFFFFF
+    if md5_hex and created > 0 and conversation_id:
+        month = _dt.datetime.fromtimestamp(created).strftime("%Y-%m")
+        talker_dir = hashlib.md5(conversation_id.encode("utf-8")).hexdigest()
+        candidates: list[Path] = []
+        if base_type == 3:
+            image_dir = account_root / "msg" / "attach" / talker_dir / month / "Img"
+            full_image = image_dir / f"{md5_hex}.dat"
+            thumb = image_dir / f"{md5_hex}_t.dat"
+            candidates = [full_image, thumb]
+        elif base_type == 43:
+            video_dir = account_root / "msg" / "video" / month
+            movie = video_dir / f"{md5_hex}.mp4"
+            cover = video_dir / f"{md5_hex}_thumb.jpg"
+            # 有视频文件时只导出视频。封面只在视频文件不存在时单独显示。
+            try:
+                has_movie = movie.is_file()
+            except OSError:
+                has_movie = False
+            candidates = [movie if has_movie else cover]
+        elif base_type == 47:
+            hit = _cached_media_by_stem(account_root).get(md5_hex)
+            # 解不开的表情缓存文件名就是 md5，挂上去只会在正文下面显示一串代码。
+            if hit is not None and _displayable_media_file(hit):
+                candidates = [hit]
+            else:
+                content = _row_content(row)
+                xml_md5 = re.search(r"<emoji\b[^>]*?\bmd5=[\"']([0-9a-fA-F]{32})[\"']", content)
+                emoji_md5 = xml_md5.group(1).lower() if xml_md5 else md5_hex
+                downloaded = fetch_emoji(content, emoji_md5, (emoji_index or {}).get(emoji_md5))
+                if downloaded is None and account_root is not None:
+                    downloaded = extract_store_emoji(account_root, emoji_md5, store_index)
+                if downloaded is not None:
+                    return [downloaded]
+        elif base_type == 34:
+            voice_dir = account_root / "msg" / "voice" / month
+            candidates = [voice_dir / f"{md5_hex}.aud", voice_dir / f"{md5_hex}.silk"]
+        for candidate in candidates:
+            if not _filesystem_path_ok(candidate):
+                continue
+            try:
+                if candidate.is_file():
+                    found.append(candidate.resolve())
+                    if base_type == 3:
+                        break
+            except OSError:
+                continue
+    direct = local_media_path(row, account_root)
+    if direct is not None and direct not in found and (not md5_hex or md5_hex in direct.name.casefold()):
+        found.append(direct)
+    return found
 
 
 # 将消息去重并按原始时间、local_id 稳定排序。
@@ -1677,6 +2301,7 @@ class WeChatReader:
             lambda path, key: open_database_backend(path, key)
         )
         self.key_path = Path(key_path).expanduser()
+        self.names_resolved = False
 
     # 发现当前账号的消息、联系人、会话和媒体数据库。
     def catalog(self) -> DatabaseCatalog:
@@ -1690,13 +2315,36 @@ class WeChatReader:
         normalized = normalize_key_hex(key_hex)
         catalog = self.catalog()
 
-        # 优先验证消息库，若无消息库或验证未过，回退验证联系人、会话、媒体等所有已知库
-        test_paths = [Path(item).resolve() for item in (paths or catalog.message_paths)]
-        if not test_paths:
-            test_paths = list(catalog.contact_paths) + list(catalog.session_paths) + list(catalog.media_paths)
-        if not test_paths:
+        # 消息、联系人、会话各自有独立密钥。先用页首 HMAC 筛出真正匹配的库，避免把无关的大库整份复制一遍。
+        if paths is None:
+            candidates = [
+                *catalog.message_paths,
+                *catalog.contact_paths,
+                *catalog.session_paths,
+                *catalog.resource_paths,
+                *catalog.emoticon_paths,
+            ]
+        else:
+            candidates = [Path(item) for item in paths]
+        if not candidates:
             # 尚未探测到具体库时，保留合法的 64 位十六进制候选，避免在扫描阶段被误删
             return ("candidate_key",)
+        test_paths: list[Path] = []
+        seen_paths: set[Path] = set()
+        for source in candidates:
+            try:
+                resolved = source.expanduser().resolve()
+            except OSError:
+                resolved = source.expanduser()
+            if resolved in seen_paths or not resolved.is_file():
+                continue
+            mode = detect_sqlcipher_key_mode(resolved, normalized)
+            # 明文库只在调用方明确指定路径时接受，避免任意候选密钥因为旁边有明文文件而被保存。
+            if mode in {"raw", "passphrase"} or (mode == "plaintext" and paths is not None):
+                seen_paths.add(resolved)
+                test_paths.append(resolved)
+        if not test_paths:
+            return ()
 
         valid: list[str] = []
         with database_snapshot(test_paths) as snapshots:
@@ -1756,10 +2404,12 @@ class WeChatReader:
                     contacts = load_contact_records(database for _source, database in message_backends)
                 if not groups:
                     groups = load_group_records(database for _source, database in message_backends)
+                self.names_resolved = bool(contacts)
                 table_index = self._build_message_table_index(message_backends)
+                usernames = load_name2id_usernames(database for _source, database in message_backends)
                 result = self._assemble_conversations(sessions, contacts, groups, table_index)
                 if not result:
-                    result = self._fallback_conversations(contacts, table_index)
+                    result = self._fallback_conversations(contacts, table_index, usernames)
                 return result
             finally:
                 for _source, database in message_backends:
@@ -1869,38 +2519,43 @@ class WeChatReader:
         result.sort(key=lambda item: (-item.sort_timestamp, item.title.casefold(), item.conversation_id))
         return result
 
-    # 当 SessionTable 不可用时，依据联系人 wxid 与 Msg_<md5> 表构造兜底会话。
+    # 当 SessionTable 不可用时，用 Name2Id 把 Msg_<md5> 还原成 wxid，并读取最新一条消息。
     def _fallback_conversations(
         self,
         contacts: Mapping[str, Mapping[str, Any]],
         table_index: Mapping[str, tuple[Path, str, DatabaseBackend]],
+        usernames: Mapping[str, str] | None = None,
     ) -> list[Conversation]:
         by_digest = {
             hashlib.md5(wxid.encode("utf-8")).hexdigest().casefold(): wxid for wxid in contacts
         }
+        by_digest.update(usernames or {})
         result: list[Conversation] = []
-        for digest, (path, table, _database) in table_index.items():
+        for digest, (path, table, database) in table_index.items():
             conversation_id = by_digest.get(digest, table)
             title = preferred_display_name(conversation_id, contacts.get(conversation_id))
             if is_system_conversation(conversation_id, title):
                 continue
+            recent_message, recent_time, recent_raw = self._latest_message_preview(
+                table, database, conversation_id
+            )
             result.append(
                 Conversation(
                     conversation_id,
                     title,
-                    "",
-                    "",
+                    recent_time,
+                    recent_message,
                     "group" if conversation_id.casefold().endswith("@chatroom") else "single",
                     conversation_id,
                     title,
                     table,
                     str(path),
-                    0.0,
+                    timestamp_seconds(recent_raw),
                 )
             )
-        return sorted(result, key=lambda item: (item.title.casefold(), item.conversation_id))
+        return sorted(result, key=lambda item: (-item.sort_timestamp, item.title.casefold(), item.conversation_id))
 
-    # 查询某个消息表中时间最新的一行，用于会话摘要兜底。
+    # 只读取排序最后的一行，避免为了会话摘要把整个消息表载入内存。
     def _latest_message_preview(
         self,
         table: str,
@@ -1908,34 +2563,38 @@ class WeChatReader:
         conversation_id: str | None = None,
     ) -> tuple[str, str, object]:
         try:
-            rows = fetch_message_rows(database, table)
+            columns = table_columns(database, table)
         except DatabaseQueryError:
             return "", "", 0
-        if conversation_id and not table.casefold().startswith("msg_"):
-            try:
-                conversation_column = choose_column(
-                    table_columns(database, table),
-                    ("conversation_id", "username", "talker", "chat_name", "user_name"),
-                )
-            except DatabaseQueryError:
-                conversation_column = None
-            if conversation_column:
-                rows = [
-                    row
-                    for row in rows
-                    if text_value(row_value(row, conversation_column, default="")) == conversation_id
-                ]
-        latest: MessageRecord | None = None
-        latest_raw: object = 0
-        for row in rows:
-            raw = row_value(row, "create_time", "CreateTime", "timestamp", "time", "sort_seq", default=0)
-            parsed = parse_message_row(row, "", self_wxid="self")
-            if latest is None or parsed.raw_timestamp > latest.raw_timestamp:
-                latest = parsed
-                latest_raw = raw
-        if latest is None:
+        if not columns:
             return "", "", 0
-        return latest.content, latest.sent_at, latest_raw
+        order_column = choose_column(columns, ("sort_seq", "create_time", "CreateTime", "timestamp"))
+        parts = ["rowid AS __rowid", *[sql_identifier(column) for column in columns]]
+        content_column = choose_column(columns, ("message_content", "Message", "content", "text", "body"))
+        if content_column:
+            parts.append(f"hex({sql_identifier(content_column)}) AS __hex_message_content")
+        where_sql = ""
+        if conversation_id and not table.casefold().startswith("msg_"):
+            conversation_column = choose_column(
+                columns, ("conversation_id", "username", "talker", "chat_name", "user_name")
+            )
+            if conversation_column:
+                where_sql = f" WHERE {sql_identifier(conversation_column)} = {sql_literal(conversation_id)}"
+        order_sql = f" ORDER BY {sql_identifier(order_column)} DESC" if order_column else ""
+        try:
+            rows = database.query(
+                f"SELECT {', '.join(parts)} FROM {sql_identifier(table)}{where_sql}{order_sql} LIMIT 1"
+            )
+        except DatabaseQueryError:
+            return "", "", 0
+        if not rows:
+            return "", "", 0
+        parsed = parse_message_row(rows[0], conversation_id or "", self_wxid="self")
+        summary = " ".join(parsed.content.split())
+        if len(summary) > 80:
+            summary = summary[:80] + "…"
+        raw_time = row_value(rows[0], "create_time", "CreateTime", "timestamp", "time", "sort_seq", default=0)
+        return summary, parsed.sent_at, raw_time
 
     # 读取一个选中会话的全部分片消息，去重后构建内存规范化模型。
     def read_conversation(
@@ -1955,6 +2614,7 @@ class WeChatReader:
             + list(catalog.media_paths)
             + list(catalog.contact_paths)
             + list(catalog.resource_paths)
+            + list(catalog.emoticon_paths)
         )
         with database_snapshot(all_paths) as snapshots:
             message_backends: list[tuple[Path, DatabaseBackend]] = []
@@ -1972,6 +2632,7 @@ class WeChatReader:
                     list(catalog.contact_paths)
                     + list(catalog.media_paths)
                     + list(catalog.resource_paths)
+                    + list(catalog.emoticon_paths)
                 ):
                     try:
                         database, _key = open_with_candidate_keys(snapshots[source], normalized_keys, self.database_factory)
@@ -1982,6 +2643,8 @@ class WeChatReader:
                 contacts = load_contact_records(auxiliary_backends)
                 groups = load_group_records(auxiliary_backends)
                 sender_resource = load_sender_resource_map(auxiliary_backends)
+                emoji_index = load_emoticon_index(auxiliary_backends)
+                store_index = load_store_emoticon_index(auxiliary_backends)
                 if not contacts:
                     contacts = load_contact_records(database for _source, database in message_backends)
                 if not groups:
@@ -2045,19 +2708,23 @@ class WeChatReader:
                             if text_value(row_value(row, conversation_column, default=""))
                             == str(conversation_id)
                         ]
+                    # Name2Id 和 message_resource.db 的 SenderName2Id 是两套编号，不能合并，否则同号会认错人。
+                    local_senders = load_name2id_by_rowid(database)
+                    sender_map = local_senders if local_senders else dict(sender_resource)
                     for row in rows:
                         message = parse_message_row(
                             row,
                             str(conversation_id),
                             contacts=contacts,
-                            sender_resource=sender_resource,
+                            sender_resource=sender_map,
                             self_wxid=self_wxid,
                         )
                         if cutoff is not None and message.raw_timestamp and message.raw_timestamp < cutoff:
                             continue
-                        # 从 row 中保留在账号目录内的图片/视频/文件路径。
-                        candidate_path = local_media_path(row, catalog.account_root)
-                        if candidate_path is not None:
+                        # source 字段是压缩数据，不能当成路径。按媒体 md5 读取真实文件。
+                        for candidate_path in local_media_files(
+                            row, catalog.account_root, str(conversation_id), emoji_index, store_index
+                        ):
                             message.media.extend(self._media_from_local_path(message.local_id, candidate_path))
                         messages.append(message)
                 messages = deduplicate_messages(messages)
@@ -2068,6 +2735,11 @@ class WeChatReader:
                 ]
                 if media_backends:
                     self._attach_voice_media(messages, str(conversation_id), media_backends)
+                # local_id 只在单个消息库内唯一。用它给 HTML 归媒体，会把别的分片里同号消息的视频贴过来。
+                for index, message in enumerate(messages, start=1):
+                    message.local_id = index
+                    for item in message.media:
+                        item.message_id = index
                 contact = contacts.get(str(conversation_id), {})
                 group = groups.get(str(conversation_id), {})
                 title = preferred_display_name(str(conversation_id), contact, group)
@@ -2098,11 +2770,14 @@ class WeChatReader:
     ) -> str:
         if account_root is not None:
             name = account_root.name
-            for candidate in (name, name.split("_", 1)[0]):
-                if candidate.startswith("wxid_") and candidate:
-                    return candidate
-                if candidate and candidate in contacts and "@" not in candidate:
-                    return candidate
+            short = name.rsplit("_", 1)[0]
+            for candidate in (name, short):
+                if candidate.startswith("wxid_") and candidate in contacts:
+                    return name if name in contacts else short
+            if name.startswith("wxid_"):
+                return name
+            if short.startswith("wxid_"):
+                return short
         for wxid, row in contacts.items():
             if row_value(row, "is_self", "self_flag", "is_me", default=False) in (1, True, "1"):
                 return wxid
@@ -2170,17 +2845,59 @@ class WeChatReader:
 
     # 把账号目录内的已有媒体文件转换成消息媒体记录。
     def _media_from_local_path(self, message_id: int, path: Path) -> list[MediaRecord]:
-        if path.suffix.casefold() == ".dat":
-            # 微信图片 .dat 通常仍是加密容器，直接复制会产生不可显示的乱码文件。
-            return []
         try:
-            data = path.read_bytes()
+            data = _browser_video_bytes(path)
         except OSError:
             return []
-        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        media_type = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "file"
+        if path.suffix.casefold() == ".dat" or data[:6] in {b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07"}:
+            decoded = _decode_wechat_dat(path)
+            if decoded:
+                extension = ".jpg"
+                mime = "image/jpeg"
+                if decoded.startswith(b"\x89PNG"):
+                    extension, mime = ".png", "image/png"
+                elif decoded.startswith(b"GIF8"):
+                    extension, mime = ".gif", "image/gif"
+                elif decoded.startswith(b"RIFF"):
+                    extension, mime = ".webp", "image/webp"
+                return [
+                    MediaRecord(
+                        message_id,
+                        "image",
+                        mime,
+                        f"image_{message_id}{extension}",
+                        decoded,
+                        str(path),
+                        True,
+                    )
+                ]
+            # V2 图片没有密钥时仍保存原始 dat，避免这条消息的文件丢失。
+            return [
+                MediaRecord(
+                    message_id,
+                    "file",
+                    "application/octet-stream",
+                    f"image_{message_id}.dat",
+                    data,
+                    str(path),
+                    False,
+                )
+            ]
+        if data.startswith(b"\xff\xd8\xff"):
+            mime, media_type, filename = "image/jpeg", "image", f"image_{message_id}.jpg"
+        elif data.startswith(b"\x89PNG"):
+            mime, media_type, filename = "image/png", "image", f"image_{message_id}.png"
+        elif data.startswith(b"GIF8"):
+            mime, media_type, filename = "image/gif", "image", f"image_{message_id}.gif"
+        elif data.startswith(b"RIFF"):
+            mime, media_type, filename = "image/webp", "image", f"image_{message_id}.webp"
+        else:
+            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            media_type = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "file"
+            filename = safe_filename(path.name, f"media_{message_id}")
         playable = media_type in {"image", "video"} or mime.casefold() in PLAYABLE_AUDIO_MIMES
-        return [MediaRecord(message_id, media_type, mime, safe_filename(path.name, f"media_{message_id}"), data, str(path), playable)]
+        return [MediaRecord(message_id, media_type, mime, filename, data, str(path), playable)]
+
 
     # 使用 key 文件验证当前可见的所有消息分片，供 DTrace 回调调用。
     def validate_candidate_key(self, key_hex: str) -> tuple[str, ...]:
@@ -2416,7 +3133,7 @@ def media_bytes(item: Mapping[str, Any]) -> bytes:
 
 # 判断链接是否允许在 HTML 导出中作为可点击 URL。
 def safe_link_url(value: object) -> str | None:
-    text = str(value or "").strip()
+    text = html.unescape(str(value or "").strip())
     if not text:
         return None
     lowered = text.casefold()
@@ -2525,6 +3242,7 @@ def render_message_html(
             + "</div></blockquote>"
         )
     link_url = safe_link_url(message.get("link_url"))
+    showed_link = False
     if link_url:
         link_title = html.escape(str(message.get("link_title") or content or "链接"))
         link_description = html.escape(str(message.get("link_description") or ""))
@@ -2538,9 +3256,13 @@ def render_message_html(
             + (f'<small class="link-source">{link_source}</small>' if link_source else "")
             + "</a>"
         )
-    elif content_html:
+        showed_link = True
+    media_items = list(media_by_message.get(local_id, []))
+    if any(str(item.get("media_type", "")).casefold() == "video" for item in media_items):
+        media_items = [item for item in media_items if str(item.get("media_type", "")).casefold() != "image"]
+    if content_html and not showed_link and not (media_items and content in {"[图片]", "[视频]", "[表情]"}):
         body.append(f'<div class="message-content">{content_html}</div>')
-    for item in media_by_message.get(local_id, []):
+    for item in media_items:
         relative = html.escape(str(item.get("relative_path", "")), quote=True)
         media_type = str(item.get("media_type", "file")).casefold()
         playable = bool(item.get("playable", False)) or str(item.get("mime_type", "")).casefold() in PLAYABLE_AUDIO_MIMES
@@ -2574,10 +3296,24 @@ def render_message_html(
     )
 
 
+# 删掉上一次导出写在这个目录里的文件，便于直接覆盖。不删除目录中的其他文件。
+def clear_previous_export(destination: Path, names: Iterable[str]) -> None:
+    for name in names:
+        path = destination / name
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+        except OSError as exc:
+            raise ReaderError("无法覆盖已有导出文件") from exc
+
+
 # 导出微信会话为带微信绿主题的 index.html 和 manifest.json。
 def export_html(model: Mapping[str, Any], output_dir: Path | str) -> Path:
     destination = Path(output_dir).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
+    clear_previous_export(destination, ("index.html", "manifest.json", "media"))
     user_names = model_user_names(model)
     media_by_message, manifest_media = write_export_media(model.get("media", []) or [], destination)
     messages = [item for item in (model.get("messages", []) or []) if isinstance(item, Mapping)]
@@ -2641,6 +3377,7 @@ audio, video {{ max-width: 100%; margin-top: 8px; }}
 def export_text(model: Mapping[str, Any], output_dir: Path | str) -> Path:
     destination = Path(output_dir).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
+    clear_previous_export(destination, ("chat.txt",))
     user_names = model_user_names(model)
     media_by_message = model_media_by_message(model)
     lines: list[str] = []
@@ -2686,6 +3423,7 @@ def export_text(model: Mapping[str, Any], output_dir: Path | str) -> Path:
 def export_sqlite(model: Mapping[str, Any], output_dir: Path | str) -> Path:
     destination = Path(output_dir).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
+    clear_previous_export(destination, ("chat.sqlite", ".chat.sqlite.tmp"))
     target = destination / "chat.sqlite"
     temporary = destination / ".chat.sqlite.tmp"
     temporary.unlink(missing_ok=True)

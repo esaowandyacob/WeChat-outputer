@@ -1,4 +1,7 @@
-"""V2 图片 AES 密钥提取（Linux）。
+"""V2 图片 AES 密钥提取。
+
+macOS：密钥可由 kvcomm 目录里的 code 和 wxid 推导，见 derive_image_key_macos，不需要读内存。
+Linux：
 
 原理：微信只在「正在查看图片」时把 V2 密钥加载进内存，用完即释放。
 密钥形态是 16/32 字符的 ASCII 字符串（参考实现同款结论），
@@ -9,11 +12,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import struct
 import subprocess
+import tempfile
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -181,7 +186,7 @@ def _scan_once_with_pair(dat: Path, jpg: Path, log=print) -> str | None:
     return None
 
 
-def _save_image_key(key_hex: str, log=print):
+def _save_image_key(key_hex: str, log=print, xor_key: int | None = None):
     # 规范化为可直接使用的形态：16 字节密钥若是可打印 ASCII（V2 实际形态），
     # 存 ASCII 字符串本身，避免 parse_image_key 对 32 位 hex 的歧义误判。
     store = key_hex
@@ -198,6 +203,8 @@ def _save_image_key(key_hex: str, log=print):
         except json.JSONDecodeError:
             pass
     cfg["image_key"] = store
+    if xor_key is not None:
+        cfg["image_xor_key"] = int(xor_key) & 0xFF
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     os.chmod(CONFIG_FILE, 0o600)
     _chown_user(CONFIG_FILE)
@@ -350,6 +357,188 @@ def extract_image_key(db_storage: Path, passes: int = 3, log=print) -> str | Non
     log("[✗] 未找到。密钥只在微信「正在查看图片」时加载进内存——"
         "请在微信里连续点开 2-3 张图片（全屏查看），然后立即重跑。")
     return None
+
+
+def _v2_samples(account_root: Path, limit: int = 8) -> list[bytes]:
+    """取几份 V2 图片的首个 AES 块。缩略图也行，只需要第一块。"""
+    attach = account_root / "msg" / "attach"
+    blocks: list[bytes] = []
+    if not attach.is_dir():
+        return blocks
+    for path in attach.rglob("*.dat"):
+        try:
+            with open(path, "rb") as handle:
+                head = handle.read(31)
+        except OSError:
+            continue
+        if head[:6] == b"\x07\x08V2\x08\x07" and len(head) == 31:
+            blocks.append(head[15:31])
+            if len(blocks) >= limit:
+                break
+    return blocks
+
+
+def _kvcomm_codes(account_root: Path) -> list[int]:
+    """kvcomm 目录里 key_<code>_*.statistic 文件名中的 code。"""
+    documents = account_root.parent.parent
+    codes: list[int] = []
+    for folder in documents.glob("app_data/**/kvcomm"):
+        try:
+            names = [entry.name for entry in folder.iterdir()]
+        except OSError:
+            continue
+        for name in names:
+            match = re.match(r"key_(\d+)_.+\.statistic$", name)
+            if match:
+                code = int(match.group(1))
+                if code and code not in codes:
+                    codes.append(code)
+    return codes
+
+
+def _wxid_candidates(account_root: Path) -> list[str]:
+    """目录名形如 wxid_xxx_a9d3，推导用的是去掉末尾 4 位后缀的 wxid。"""
+    name = account_root.name
+    candidates: list[str] = []
+    match = re.fullmatch(r"(.+)_[0-9a-z]{4}", name)
+    if match:
+        candidates.append(match.group(1))
+    candidates.append(name)
+    return candidates
+
+
+def derive_image_key_macos(account_root: Path) -> tuple[str, int] | None:
+    """微信 4.x macOS：aes_key = md5(code + wxid) 的前 16 个十六进制字符，xor_key = code & 0xFF。
+
+    推导结果必须能解开本地 V2 图片的第一块才返回，避免把错误密钥写进配置。
+    """
+    from Crypto.Cipher import AES
+
+    from wxwatch.imagedat import _looks_image
+
+    blocks = _v2_samples(account_root)
+    if not blocks:
+        return None
+    for code in _kvcomm_codes(account_root):
+        for wxid in _wxid_candidates(account_root):
+            key = hashlib.md5(f"{code}{wxid}".encode("utf-8")).hexdigest()[:16]
+            cipher = AES.new(key.encode("ascii"), AES.MODE_ECB)
+            hits = 0
+            for block in blocks:
+                plain = cipher.decrypt(block)
+                if _looks_image(plain) or plain.startswith(b"wxgf"):
+                    hits += 1
+            if hits * 2 > len(blocks):
+                return key, code & 0xFF
+    return None
+
+
+def ensure_image_key_macos(account_root: Path, log=lambda *_args: None) -> str | None:
+    """推导并保存 macOS 图片密钥。成功返回密钥字符串。"""
+    derived = derive_image_key_macos(account_root)
+    if derived is None:
+        return None
+    key, xor_key = derived
+    _save_image_key(key, log=log, xor_key=xor_key)
+    return key
+
+
+def _v2_ciphertext(sample: Path) -> bytes:
+    data = sample.read_bytes()
+    aes_size = struct.unpack("<I", data[6:10])[0]
+    aligned = aes_size + (16 - aes_size % 16)
+    return data[15:15 + aligned]
+
+
+def _macos_image_pids(preferred: int) -> list[int]:
+    """图片密钥在主进程或辅助进程的内存里，不能只扫一个 PID。"""
+    found: list[int] = []
+    try:
+        listing = subprocess.check_output(["ps", "-ax", "-o", "pid=,command="], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return [preferred] if preferred else []
+    for line in listing.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        name = Path(command.split(" --", 1)[0]).name
+        if name in {"WeChat", "WeChatHelper", "wxplayer", "wxutility"}:
+            try:
+                found.append(int(pid_text))
+            except ValueError:
+                continue
+    if preferred and preferred not in found:
+        found.insert(0, preferred)
+    return found
+
+
+def _image_key_scanner() -> Path:
+    source = Path(__file__).resolve().parent / "scan_imgkey_mac.c"
+    binary = Path(tempfile.gettempdir()) / "scan_imgkey_mac"
+    if binary.exists() and binary.stat().st_mtime >= source.stat().st_mtime:
+        return binary
+    subprocess.run(["clang", "-O2", "-o", str(binary), str(source)], check=True)
+    return binary
+
+
+def capture_image_key_macos(
+    pid: int,
+    account_root: Path,
+    duration: float = 60,
+    on_status=None,
+) -> str | None:
+    """按 Linux 的方式在进程内存里找图片密钥。微信只在全屏看图时把密钥放进内存。"""
+    import sys
+    import time
+
+    sys.path.insert(0, str(PROJECT))
+    from cccryptor_probe import ensure_sudo_credentials
+
+    derived = ensure_image_key_macos(account_root)
+    if derived:
+        if on_status:
+            on_status("已根据本机微信配置推导出图片密钥")
+        return derived
+    sample = _pick_v2_sample(account_root / "db_storage")
+    if sample is None:
+        raise RuntimeError("未找到可用来验证的 V2 图片文件")
+    credential_error = ensure_sudo_credentials()
+    if credential_error:
+        raise RuntimeError(credential_error)
+    ciphertext = _v2_ciphertext(sample).hex()
+    scanner = _image_key_scanner()
+    if on_status:
+        on_status("正在从微信内存里找图片密钥。请保持一张聊天图片处于全屏")
+    deadline = time.monotonic() + duration
+    errors: list[str] = []
+    while time.monotonic() < deadline:
+        for target in _macos_image_pids(pid):
+            completed = subprocess.run(
+                ["sudo", "-n", str(scanner), str(target), ciphertext],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            found = completed.stdout.strip().splitlines()
+            sample_bytes = sample.read_bytes()
+            from wxwatch.imagedat import _decode_v12, parse_image_key
+            for line in found:
+                key = line.strip()
+                raw_key = parse_image_key(key)
+                if raw_key is None:
+                    continue
+                if _decode_v12(sample_bytes, raw_key) is None:
+                    continue
+                _save_image_key(key, log=lambda *_args: None)
+                return key
+            detail = completed.stderr.strip()
+            if detail:
+                errors.append(detail)
+        time.sleep(1)
+    if errors and all("task_for_pid" in item for item in errors):
+        raise RuntimeError(errors[0])
+    raise RuntimeError("内存里没有找到能解开本地图片的密钥。请先点开一张聊天图片到全屏，再点采集，并在结束前不要关掉这张图。")
 
 
 def main():

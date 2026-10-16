@@ -32,6 +32,7 @@ from read_wechat_conversation import (
     WeChatReader,
     export_model,
     parse_recent_days,
+    safe_filename,
 )
 
 
@@ -45,6 +46,30 @@ EXPORT_COLORS = {
 
 
 # 返回当前平台默认的导出目录。
+def _emoticon_key_status() -> str:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    if not config_path.is_file():
+        return "表情密钥：尚未采集"
+    try:
+        import json
+        saved = json.loads(config_path.read_text(encoding="utf-8")).get("emoticon_key")
+    except (OSError, json.JSONDecodeError):
+        return "表情密钥：尚未采集"
+    return "表情密钥：已保存" if saved else "表情密钥：尚未采集"
+
+
+def _image_key_status() -> str:
+    config_path = Path(__file__).resolve().parent / "config.json"
+    if not config_path.is_file():
+        return "图片密钥：尚未采集"
+    try:
+        import json
+        saved = json.loads(config_path.read_text(encoding="utf-8")).get("image_key")
+    except (OSError, json.JSONDecodeError):
+        return "图片密钥：尚未采集"
+    return "图片密钥：已保存" if saved else "图片密钥：尚未采集"
+
+
 def _default_export_dir() -> Path:
     desktop = Path.home() / "Desktop"
     if desktop.is_dir():
@@ -191,6 +216,7 @@ class WeChatExportApp(tk.Tk):
         self._captured_masks: list[str] = []
         self.conversations: list[Conversation] = []
         self.selected_conversation: Conversation | None = None
+        self.selected_conversations: list[Conversation] = []
         self._status_after_id: str | None = None
         self._delayed_status_id: str | None = None
         self._worker_busy = False
@@ -257,6 +283,9 @@ class WeChatExportApp(tk.Tk):
     def _build_key_step(self) -> None:
         frame = tk.Frame(self.body, bg="#F5F6F7")
         self.step_frames.append(frame)
+        # 先占住底部，窗口较矮时「进入会话选择」也不会被上面的卡片挤出屏幕。
+        bottom = tk.Frame(frame, bg="#F5F6F7")
+        bottom.pack(fill="x", side="bottom", pady=(12, 0))
         tk.Label(frame, text="第一步：获取密钥", bg="#F5F6F7", fg="#1F2329", font=(UI_FONT, 17, "bold")).pack(anchor="w")
         tk.Label(
             frame,
@@ -290,6 +319,22 @@ class WeChatExportApp(tk.Tk):
             command=self._start_capture,
         )
         self.capture_button = self.capture_row.winfo_children()[-1]
+        self.image_key_var = tk.StringVar(value=_image_key_status())
+        self.image_key_row = self._status_row(
+            frame,
+            self.image_key_var,
+            tk.StringVar(value=""),
+            button_text="采集图片密钥",
+            command=self._start_image_key_capture,
+        )
+        self.emoticon_key_var = tk.StringVar(value=_emoticon_key_status())
+        self.emoticon_key_row = self._status_row(
+            frame,
+            self.emoticon_key_var,
+            tk.StringVar(value=""),
+            button_text="采集表情密钥",
+            command=self._start_emoticon_key_capture,
+        )
         path_box = tk.Frame(frame, bg="#FFFFFF", padx=14, pady=12)
         path_box.pack(fill="x", pady=(22, 10))
         tk.Label(path_box, text="密钥文件路径", bg="#FFFFFF", fg="#56606A", font=(UI_FONT, 11)).pack(anchor="w")
@@ -310,8 +355,6 @@ class WeChatExportApp(tk.Tk):
         tk.Label(frame, text="本次运行捕获的密钥（已脱敏）", bg="#F5F6F7", fg="#56606A", font=(UI_FONT, 11)).pack(anchor="w", pady=(10, 4))
         self.captured_list_var = tk.StringVar(value="暂无")
         tk.Label(frame, textvariable=self.captured_list_var, bg="#F5F6F7", fg="#30363B", justify="left", anchor="w", wraplength=760).pack(fill="x")
-        bottom = tk.Frame(frame, bg="#F5F6F7")
-        bottom.pack(fill="x", side="bottom", pady=(22, 0))
         actions = tk.Frame(bottom, bg="#F5F6F7")
         actions.pack(side="right")
         self.key_count_var = tk.StringVar(value="已保存密钥：0 个")
@@ -346,16 +389,19 @@ class WeChatExportApp(tk.Tk):
         top.pack(fill="x")
         tk.Label(top, text="第二步：选择会话", bg="#F5F6F7", fg="#1F2329", font=(UI_FONT, 17, "bold")).pack(side="left")
         FlatButton(top, "刷新", self._load_conversations, background="#E8F8EF", hover_background="#D7F3E4", foreground="#078A4A").pack(side="right")
-        tk.Label(frame, text="公众号、服务通知和系统会话已隐藏。", bg="#F5F6F7", fg="#737A81").pack(anchor="w", pady=(5, 13))
+        FlatButton(top, "取消全选", self._clear_conversation_selection, background="#EEF1F3", hover_background="#E1E6E9", foreground="#56606A").pack(side="right", padx=(0, 8))
+        FlatButton(top, "全选", self._select_all_conversations, background="#E8F8EF", hover_background="#D7F3E4", foreground="#078A4A").pack(side="right", padx=(0, 8))
+        self.conversation_hint_var = tk.StringVar(value="公众号、服务通知和系统会话已隐藏。按住 Command 点选可多选，Shift 可连选。")
+        tk.Label(frame, textvariable=self.conversation_hint_var, bg="#F5F6F7", fg="#737A81", justify="left", anchor="w", wraplength=820).pack(anchor="w", pady=(5, 13))
         table_frame = tk.Frame(frame, bg="#FFFFFF")
         table_frame.pack(fill="both", expand=True)
-        self.conversation_tree = ttk.Treeview(table_frame, columns=("recent_time", "title", "recent_message"), show="headings", style="WeChat.Treeview", selectmode="browse")
+        self.conversation_tree = ttk.Treeview(table_frame, columns=("recent_time", "title", "recent_message"), show="headings", style="WeChat.Treeview", selectmode="extended")
         self.conversation_tree.heading("recent_time", text="最近时间")
-        self.conversation_tree.heading("title", text="会话标题")
+        self.conversation_tree.heading("title", text="会话")
         self.conversation_tree.heading("recent_message", text="最近消息摘要")
-        self.conversation_tree.column("recent_time", width=160, anchor="w")
-        self.conversation_tree.column("title", width=220, anchor="w")
-        self.conversation_tree.column("recent_message", width=450, anchor="w")
+        self.conversation_tree.column("recent_time", width=150, minwidth=120, anchor="w", stretch=False)
+        self.conversation_tree.column("title", width=280, minwidth=160, anchor="w", stretch=False)
+        self.conversation_tree.column("recent_message", width=420, minwidth=180, anchor="w", stretch=True)
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.conversation_tree.yview)
         self.conversation_tree.configure(yscrollcommand=scrollbar.set)
         self.conversation_tree.pack(side="left", fill="both", expand=True)
@@ -506,9 +552,9 @@ class WeChatExportApp(tk.Tk):
         if isinstance(capture_button, FlatButton):
             capture_button.set_enabled(False)
         duration = 60
-        self.capture_var.set(f"⏳ 启动密钥采集（剩余 {duration} 秒）")
+        self.capture_var.set("⏳ 正在检查 DTrace。需要授权时只会弹出一次密码框。")
         self._captured_masks = []
-        listening_hint = "正在监听，请在微信中登录并打开几个会话…"
+        listening_hint = "授权后会监听约 60 秒，请在微信中打开几个会话。"
         self.captured_list_var.set(listening_hint)
 
         # 把采集倒计时安全地投递到 Tk 主线程。
@@ -557,6 +603,92 @@ class WeChatExportApp(tk.Tk):
 
         threading.Thread(target=worker, name="wechat-capture", daemon=True).start()
 
+    # 采集 V2 图片密钥。先按本机微信配置推导，推导不出再从内存里找（需全屏看图）。
+    def _start_image_key_capture(self) -> None:
+        if self._worker_busy:
+            return
+        status = detect_wechat()
+        if not status.running or status.pid is None:
+            messagebox.showwarning("需要启动微信", "请先启动并登录微信。")
+            return
+        account_root = self.reader.catalog().account_root
+        if account_root is None:
+            self._show_copyable_dialog("采集失败", "没有找到微信数据目录，无法验证图片密钥。")
+            return
+        self._worker_busy = True
+        self.image_key_var.set("⏳ 正在推导图片密钥")
+
+        def worker() -> None:
+            try:
+                from wxwatch.imagekey import capture_image_key_macos
+
+                found = capture_image_key_macos(
+                    status.pid or 0,
+                    account_root,
+                    on_status=lambda detail: self._post_ui(lambda text=detail: self.image_key_var.set(f"⏳ {text}")),
+                )
+            except Exception as exc:
+                detail = _safe_error_message(exc)
+                self._post_ui(lambda: self._image_key_finished(False, detail))
+                return
+            self._post_ui(lambda: self._image_key_finished(bool(found), ""))
+
+        threading.Thread(target=worker, name="wechat-image-key", daemon=True).start()
+
+    # 更新图片密钥采集结果。界面不显示密钥本身。
+    def _image_key_finished(self, found: bool, detail: str) -> None:
+        self._worker_busy = False
+        self.image_key_var.set(_image_key_status() if found else "图片密钥：没有采到")
+        if found:
+            self._show_copyable_dialog("图片密钥已保存", "图片密钥已写入 config.json。请重新导出，照片会解密后显示。")
+            return
+        message = detail or "没有验证通过。请在采集开始后，立刻在微信里全屏打开 2 到 3 张普通照片，不要只发表情。"
+        self._show_copyable_dialog("图片密钥未采到", message)
+
+    # 采集商店表情包的 16 字节密钥。数据库采集不会留下这一档。
+    def _start_emoticon_key_capture(self) -> None:
+        if self._worker_busy:
+            return
+        status = detect_wechat()
+        if not status.running or status.pid is None:
+            messagebox.showwarning("需要启动微信", "请先启动并登录微信，再打开表情面板。")
+            return
+        account_root = self.reader.catalog().account_root
+        if account_root is None:
+            self._show_copyable_dialog("采集失败", "没有找到微信数据目录。")
+            return
+        sample = next(((account_root / "business" / "emoticon" / "PersistStore").rglob("*")), None)
+        if sample is None or not sample.is_file():
+            self._show_copyable_dialog("采集失败", "没有找到商店表情安装包，无法验证密钥。")
+            return
+        self._worker_busy = True
+        self.emoticon_key_var.set("⏳ 请打开表情面板，并点开一套已安装的商店表情")
+
+        def worker() -> None:
+            try:
+                from cccryptor_probe import capture_emoticon_key
+
+                found = capture_emoticon_key(
+                    status.pid or 0,
+                    sample.read_bytes(),
+                    on_status=lambda detail: self._post_ui(lambda text=detail: self.emoticon_key_var.set(f"⏳ {text}")),
+                )
+            except Exception as exc:
+                detail = _safe_error_message(exc)
+                self._post_ui(lambda: self._emoticon_key_finished(False, detail))
+                return
+            self._post_ui(lambda: self._emoticon_key_finished(found is not None, ""))
+
+        threading.Thread(target=worker, name="wechat-emoticon-key", daemon=True).start()
+
+    def _emoticon_key_finished(self, found: bool, detail: str) -> None:
+        self._worker_busy = False
+        self.emoticon_key_var.set(_emoticon_key_status() if found else "表情密钥：没有采到")
+        if found:
+            self._show_copyable_dialog("表情密钥已保存", "16 字节表情密钥已写入 config.json。请重新导出，商店表情会从本地安装包里解开。")
+            return
+        self._show_copyable_dialog("表情密钥未采到", detail or "请在采集过程中打开表情面板，并点开一套商店表情。")
+
     # 处理采集线程结束结果并恢复按钮颜色。
     def _capture_finished(self, result: CaptureResult, capture_button: tk.Misc) -> None:
         self._worker_busy = False
@@ -571,6 +703,102 @@ class WeChatExportApp(tk.Tk):
             self.capture_var.set("❌ 密钥采集完成，但没有候选通过验证")
         if result.report:
             self.captured_list_var.set(result.report)
+        title, message = self._capture_result_message(result)
+        self._show_copyable_dialog(title, message)
+
+    # 生成采集结果的标题和可复制正文，不包含完整密钥。
+    def _capture_result_message(self, result: CaptureResult) -> tuple[str, str]:
+        if result.error:
+            return "采集失败", result.error
+        if result.validated_keys:
+            lines = [
+                f"密钥采集完成，验证成功 {len(result.validated_keys)} 个。",
+                f"已保存到：{self.key_path}",
+            ]
+            if result.report:
+                lines.extend(["", result.report])
+            return "采集成功", "\n".join(lines)
+        lines = ["密钥采集完成，但没有候选通过验证。请在监听的 60 秒内打开几个微信会话。"]
+        if result.report:
+            lines.extend(["", result.report])
+        return "采集未验证通过", "\n".join(lines)
+
+    # 弹出可选中的结果窗口，并用按钮把全文放进剪贴板。
+    def _show_copyable_dialog(self, title: str, message: str) -> tk.Toplevel:
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.geometry("720x380")
+        dialog.minsize(520, 260)
+        dialog.transient(self)
+        dialog.configure(bg="#F5F6F7")
+        body = tk.Frame(dialog, bg="#FFFFFF")
+        body.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        text = tk.Text(
+            body,
+            wrap="word",
+            font=(UI_FONT, 12),
+            bg="#FFFFFF",
+            fg="#1F2329",
+            relief="flat",
+            padx=10,
+            pady=10,
+            highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        text.insert("1.0", message)
+        text.tag_add("sel", "1.0", "end-1c")
+        text.focus_set()
+
+        # 保留方向键、全选和复制，其余按键不改文本。
+        def ignore_edit(event: tk.Event[tk.Misc]) -> str | None:
+            key = str(event.keysym).lower()
+            navigation = {
+                "left",
+                "right",
+                "up",
+                "down",
+                "home",
+                "end",
+                "prior",
+                "next",
+                "shift_l",
+                "shift_r",
+                "control_l",
+                "control_r",
+                "meta_l",
+                "meta_r",
+                "alt_l",
+                "alt_r",
+                "super_l",
+                "super_r",
+            }
+            if key in navigation:
+                return None
+            if event.state & (0x4 | 0x8 | 0x10 | 0x100000) and key in {"c", "a", "insert"}:
+                return None
+            return "break"
+
+        text.bind("<Key>", ignore_edit)
+        buttons = tk.Frame(dialog, bg="#F5F6F7")
+        buttons.pack(fill="x", padx=16, pady=(0, 16))
+
+        # 把结果全文写入剪贴板，方便粘贴到终端或聊天里。
+        def copy_message() -> None:
+            self.clipboard_clear()
+            self.clipboard_append(message)
+            self.update_idletasks()
+            copy_button.configure(text="已复制")
+
+        FlatButton(buttons, "关闭", dialog.destroy, background="#E8ECEF", hover_background="#DDE3E7", foreground="#56606A").pack(side="right")
+        copy_button = FlatButton(buttons, "复制全部", copy_message, background="#07C160", hover_background="#06AD56")
+        copy_button.pack(side="right", padx=(0, 8))
+        dialog.copy_button = copy_button
+        dialog.result_text = text
+        dialog.lift()
+        return dialog
 
     # 进入会话选择页并在后台读取会话列表。
     def _enter_conversations(self) -> None:
@@ -601,35 +829,71 @@ class WeChatExportApp(tk.Tk):
             self.conversation_tree.delete(item)
         self.conversations = conversations
         self.selected_conversation = None
+        self.selected_conversations = []
         self.to_export_button.set_enabled(False)
         if error is not None:
             self.selected_var.set(f"读取失败：{_safe_error_message(error)}")
             return
+        if getattr(self.reader, "names_resolved", False):
+            self.conversation_hint_var.set("公众号、服务通知和系统会话已隐藏。按住 Command 点选可多选，Shift 可连选。")
+        else:
+            self.conversation_hint_var.set(
+                "当前显示的是微信 ID，不是昵称。昵称在 contact.db，它的密钥和消息库不是同一把。"
+                "请回到上一步再点“启动采集”，并在 60 秒内完全退出微信后重新打开。按住 Command 可多选。"
+            )
         for index, conversation in enumerate(conversations):
             self.conversation_tree.insert("", "end", iid=str(index), values=(conversation.recent_time, conversation.title, conversation.recent_message))
         self.selected_var.set(f"共发现 {len(conversations)} 个可导出会话")
 
-    # 更新当前选中的会话及底部确认文本。
-    def _conversation_selected(self, _event: tk.Event[tk.Misc]) -> None:
-        selection = self.conversation_tree.selection()
-        if not selection:
-            self.selected_conversation = None
-            self.to_export_button.set_enabled(False)
-            return
-        try:
-            selected = self.conversations[int(selection[0])]
-        except (IndexError, ValueError):
-            return
-        self.selected_conversation = selected
-        self.selected_var.set(f"已选择：{selected.title}（{selected.conversation_id}）")
-        self.to_export_button.set_enabled(True)
+    # 返回当前表格里选中的会话，保持列表中的原有顺序。
+    def _selected_conversations(self) -> list[Conversation]:
+        chosen: list[Conversation] = []
+        for item in self.conversation_tree.selection():
+            try:
+                chosen.append(self.conversations[int(item)])
+            except (IndexError, ValueError):
+                continue
+        return chosen
 
-    # 进入第三步并显示当前会话标题及 ID。
-    def _show_export_step(self) -> None:
-        if self.selected_conversation is None:
+    # 选中表格中的全部会话。
+    def _select_all_conversations(self) -> None:
+        children = self.conversation_tree.get_children()
+        if children:
+            self.conversation_tree.selection_set(children)
+        self._conversation_selected(None)
+
+    # 清除会话表格的选择。
+    def _clear_conversation_selection(self) -> None:
+        self.conversation_tree.selection_remove(self.conversation_tree.selection())
+        self._conversation_selected(None)
+
+    # 更新当前选中的会话及底部确认文本。
+    def _conversation_selected(self, _event: tk.Event[tk.Misc] | None) -> None:
+        chosen = self._selected_conversations()
+        self.selected_conversations = chosen
+        self.selected_conversation = chosen[0] if len(chosen) == 1 else None
+        self.to_export_button.set_enabled(bool(chosen))
+        if not chosen:
+            self.selected_var.set(f"共 {len(self.conversations)} 个会话，未选择")
             return
-        selected = self.selected_conversation
-        self.export_conversation_var.set(f"已选择：{selected.title}（{selected.conversation_id}）")
+        preview = "、".join(item.title for item in chosen[:3])
+        if len(chosen) > 3:
+            preview = f"{preview} 等 {len(chosen)} 个"
+        self.selected_var.set(f"已选择 {len(chosen)} 个：{preview}")
+
+    # 进入第三步并显示当前选中的会话。
+    def _show_export_step(self) -> None:
+        selected = self._selected_conversations()
+        if not selected:
+            return
+        self.selected_conversations = selected
+        self.selected_conversation = selected[0] if len(selected) == 1 else None
+        if len(selected) == 1:
+            self.export_conversation_var.set(f"已选择：{selected[0].title}（{selected[0].conversation_id}）")
+        else:
+            preview = "、".join(item.title for item in selected[:4])
+            suffix = f" 等 {len(selected)} 个会话" if len(selected) > 4 else f"（共 {len(selected)} 个）"
+            self.export_conversation_var.set(f"已选择：{preview}{suffix}")
         self.export_status_var.set("")
         self.last_file_label.configure(text="")
         self.last_file_path = None
@@ -641,52 +905,98 @@ class WeChatExportApp(tk.Tk):
         if selected:
             self.export_dir_var.set(selected)
 
+    # 多个会话时各自使用子目录，避免 index.html 互相覆盖。
+    def _export_directory(self, conversation: Conversation, root: Path, multiple: bool) -> Path:
+        if not multiple:
+            return root
+        folder = safe_filename(conversation.title or conversation.conversation_id, "chat")
+        suffix = safe_filename(conversation.conversation_id, "id")[-12:]
+        return root / f"{folder}_{suffix}"
+
     # 二次确认后在后台读取模型并执行指定格式导出。
     def _export(self, fmt: str) -> None:
-        if self.selected_conversation is None or self._worker_busy:
+        selected = list(self.selected_conversations)
+        if not selected or self._worker_busy:
             return
         try:
             days = parse_recent_days(self.recent_days_entry.get())
         except ReaderError as exc:
-            messagebox.showerror("输入无效", str(exc))
+            self._show_copyable_dialog("输入无效", str(exc))
             return
         destination = Path(self.export_dir_var.get()).expanduser()
         try:
             ensure_key_path_outside_export(self.key_path, destination)
         except KeyStoreError as exc:
-            messagebox.showerror("目录不安全", str(exc))
+            self._show_copyable_dialog("目录不安全", str(exc))
             return
-        if not messagebox.askyesno("确认导出", f"确定将“{self.selected_conversation.title}”导出到\n{destination} 吗？"):
+        if len(selected) == 1:
+            confirm = f"确定将“{selected[0].title}”导出到\n{destination} 吗？该目录里已有的同名导出文件会被覆盖。"
+        else:
+            confirm = f"确定将 {len(selected)} 个会话导出到\n{destination} 吗？每个会话单独放在一个子目录，已有的同名导出文件会被覆盖。"
+        if not messagebox.askyesno("确认导出", confirm):
             return
         self._worker_busy = True
         self._set_export_buttons(False)
         self.export_status_var.set("正在读取消息并生成导出文件…")
         self.last_file_label.configure(text="")
-        selected_id = self.selected_conversation.conversation_id
+        multiple = len(selected) > 1
 
-        # 在后台线程读取消息并写入用户选择的导出格式。
+        # 在后台线程逐个读取消息并写入用户选择的导出格式。
         def worker() -> None:
-            try:
-                model = self.reader.read_conversation(selected_id, self.key_records, recent_days=days)
-                path = export_model(model, fmt, destination)
-                self._post_ui(lambda: self._export_finished(path, None))
-            except Exception as exc:
-                self._post_ui(lambda error=exc: self._export_finished(None, error))
+            exported: list[Path] = []
+            failures: list[str] = []
+            total = len(selected)
+            for index, conversation in enumerate(selected, start=1):
+                title = conversation.title
+                self._post_ui(lambda i=index, name=title, count=total: self.export_status_var.set(f"正在导出 {i}/{count}：{name}"))
+                try:
+                    model = self.reader.read_conversation(conversation.conversation_id, self.key_records, recent_days=days)
+                    path = export_model(model, fmt, self._export_directory(conversation, destination, multiple))
+                    exported.append(path)
+                except Exception as exc:
+                    failures.append(f"{title}：{_safe_error_message(exc)}")
+            self._post_ui(lambda: self._export_batch_finished(exported, failures))
 
         threading.Thread(target=worker, name="wechat-export", daemon=True).start()
+
+    # 汇总批量导出的成功路径和失败原因。
+    def _export_batch_finished(self, exported: list[Path], failures: list[str]) -> None:
+        self._worker_busy = False
+        self._set_export_buttons(True)
+        if exported:
+            self.last_file_path = exported[-1]
+            self.last_file_label.configure(text=exported[-1].name)
+        lines = [f"成功 {len(exported)} 个，失败 {len(failures)} 个。"]
+        if exported:
+            lines.append("")
+            lines.extend(str(path) for path in exported)
+        if failures:
+            lines.append("")
+            lines.append("失败：")
+            lines.extend(failures)
+        message = "\n".join(lines)
+        if failures and not exported:
+            self.export_status_var.set("导出失败")
+            self._show_copyable_dialog("导出失败", message)
+            return
+        self.export_status_var.set("导出完成" if not failures else "部分导出完成")
+        self._show_copyable_dialog("导出完成" if not failures else "部分导出完成", message)
 
     # 恢复三个导出按钮颜色并展示成功文件链接或错误。
     def _export_finished(self, path: Path | None, error: Exception | None) -> None:
         self._worker_busy = False
         self._set_export_buttons(True)
         if error is not None:
-            self.export_status_var.set(f"导出失败：{_safe_error_message(error)}")
+            message = f"导出失败：{_safe_error_message(error)}"
+            self.export_status_var.set(message)
+            self._show_copyable_dialog("导出失败", message)
             return
         if path is None:
             return
         self.last_file_path = path
         self.export_status_var.set("导出完成：")
         self.last_file_label.configure(text=path.name)
+        self._show_copyable_dialog("导出成功", f"已导出到：\n{path}")
 
     # 批量禁用或启用导出按钮，启用时恢复各自原始颜色。
     def _set_export_buttons(self, enabled: bool) -> None:

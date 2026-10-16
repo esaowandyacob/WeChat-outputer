@@ -8,7 +8,11 @@ V1 相同结构，固定密钥 cfcd208495d565ef；V2 密钥需从进程内存提
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import struct
+import subprocess
 from pathlib import Path
 
 V1_KEY = b"cfcd208495d565ef"
@@ -66,7 +70,7 @@ def _decode_xor(data: bytes) -> bytes | None:
     return None
 
 
-def _decode_v12(data: bytes, key: bytes) -> bytes | None:
+def _decode_v12(data: bytes, key: bytes, xor_key: int | None = None) -> bytes | None:
     from Crypto.Cipher import AES
     from Crypto.Util import Padding
 
@@ -87,24 +91,70 @@ def _decode_v12(data: bytes, key: bytes) -> bytes | None:
     if not _looks_image(dec_aes) and dec_aes[:4] != b"wxgf":
         return None
     offset += aligned
-    # 中段 raw（不加密），末尾 xor_size 字节单字节 XOR
-    # key 本机实测为 0x8b（参考实现默认 0x88），按 JPEG 尾部特征自动校正
+    # 中段 raw（不加密），末尾 xor_size 字节单字节 XOR。
+    # XOR key 因账号而异（macOS 上等于 kvcomm code 的低 8 位）。没给时按 JPEG 结尾 FF D9 反推。
     raw_end = len(data) - xor_size
     raw_data = data[offset:raw_end] if offset < raw_end else b""
     xor_seg = data[raw_end:]
-    xor_key = 0x8B
-    if xor_seg and dec_aes[:2] == b"\xff\xd8":
-        # JPEG 应以 FF D9 结尾；若不匹配则尝试其他常见 key
-        for cand in (0x8B, 0x88):
-            if (xor_seg[-1] ^ cand) == 0xD9:
-                xor_key = cand
-                break
+    if xor_key is None:
+        xor_key = 0x88
+        if xor_seg and dec_aes[:2] == b"\xff\xd8":
+            xor_key = xor_seg[-1] ^ 0xD9
     dec_xor = bytes(b ^ xor_key for b in xor_seg)
     return dec_aes + raw_data + dec_xor
 
 
-def decode_dat(path: str | Path, image_key: bytes | None = None) -> bytes | None:
-    """解密 .dat 图片，返回图片字节；失败返回 None。"""
+def _ffmpeg_path() -> str | None:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # 从 Finder 或 IDE 启动时 PATH 里通常没有 Homebrew / MacPorts 目录。
+    for folder in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"):
+        candidate = Path(folder) / "ffmpeg"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def wxgf_to_jpeg(data: bytes) -> bytes | None:
+    """wxgf 是微信的 HEVC 封装，浏览器不能显示。用 ffmpeg 取第一帧转成 JPEG。"""
+    if not data.startswith(b"wxgf"):
+        return None
+    # 码流从 VPS（NAL 头 40 01）开始。头部可能带 ICC 色彩配置，里面会出现假的起始码。
+    start = data.find(b"\x00\x00\x00\x01\x40\x01")
+    if start < 0:
+        start = data.find(b"\x00\x00\x00\x01")
+    ffmpeg = _ffmpeg_path()
+    if start < 0 or ffmpeg is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [ffmpeg, "-loglevel", "error", "-f", "hevc", "-i", "-", "-frames:v", "1",
+             "-f", "image2", "-c:v", "mjpeg", "-q:v", "2", "-"],
+            input=data[start:],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return completed.stdout if completed.stdout.startswith(b"\xff\xd8") else None
+
+
+def load_image_keys(config_path: str | Path) -> tuple[bytes | None, int | None]:
+    """从 config.json 读取 V2 图片的 AES 密钥和尾段 XOR 密钥。"""
+    try:
+        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    xor_key = cfg.get("image_xor_key")
+    if not isinstance(xor_key, int) or not 0 <= xor_key <= 0xFF:
+        xor_key = None
+    return parse_image_key(cfg.get("image_key")), xor_key
+
+
+def decode_dat(path: str | Path, image_key: bytes | None = None, xor_key: int | None = None) -> bytes | None:
+    """解密 .dat 图片，返回图片字节；wxgf 会转成 JPEG。失败返回 None。"""
     try:
         data = open(path, "rb").read()
     except OSError:
@@ -114,9 +164,13 @@ def decode_dat(path: str | Path, image_key: bytes | None = None) -> bytes | None
     if _looks_image(data):
         return data  # 未加密
     if data[:6] == V1_MAGIC:
-        return _decode_v12(data, V1_KEY)
-    if data[:6] == V2_MAGIC:
+        decoded = _decode_v12(data, V1_KEY, xor_key)
+    elif data[:6] == V2_MAGIC:
         if image_key is None:
             return None
-        return _decode_v12(data, image_key)
-    return _decode_xor(data)
+        decoded = _decode_v12(data, image_key, xor_key)
+    else:
+        return _decode_xor(data)
+    if decoded is not None and decoded.startswith(b"wxgf"):
+        return wxgf_to_jpeg(decoded)
+    return decoded

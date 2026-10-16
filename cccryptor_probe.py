@@ -173,6 +173,15 @@ def default_key_path(home: Path | None = None, *, platform: str | None = None) -
 
 APP_SUPPORT_DIR = default_app_support_dir()
 DEFAULT_KEY_PATH = default_key_path()
+PROBE_CHECK_TIMEOUT = 120.0
+
+# 图形密码框脚本。密码只从对话框交给 sudo，不写入这个文件。
+ASKPASS_SCRIPT = """#!/bin/sh
+/usr/bin/osascript <<'EOF'
+set dialogResult to display dialog "采集微信密钥需要管理员密码来运行 DTrace。" default answer "" with hidden answer with title "微信聊天记录导出" buttons {"取消", "确定"} default button "确定"
+text returned of dialogResult
+EOF
+"""
 
 
 # 确保父目录由当前用户创建并尽量限制为仅用户可读写。
@@ -361,8 +370,10 @@ def build_dtrace_program() -> str:
     expressions = ",\n        ".join(
         f"*(uint8_t *)copyin(arg3 + {index}, 1)" for index in range(32)
     )
+    # 探针描述只有 provider:module:function:name 四段，必须和 PROBE_SPEC 一致。
+    # pid$target::*:CCCryptorCreate:entry 多出一段，dtrace 会报 Overspecified probe description。
     return (
-        "pid$target::*:CCCryptorCreate:entry\n"
+        f"{PROBE_SPEC}\n"
         "/arg1 == 0 && arg4 == 32 && arg3 != 0/\n"
         "{\n"
         f'    printf("{DTRACE_FORMAT}",\n'
@@ -371,19 +382,234 @@ def build_dtrace_program() -> str:
     )
 
 
+# 表情包不经过数据库那条 32 字节校验。16 和 32 字节的 AES 都抓下来，直接拿安装包试解。
+def build_emoticon_dtrace_program() -> str:
+    def clause(function: str, size: int) -> str:
+        expressions = ",\n        ".join(f"*(uint8_t *)copyin(arg3 + {index}, 1)" for index in range(size))
+        return (
+            f"pid$target:*:{function}:entry\n"
+            f"/arg1 == 0 && arg4 == {size} && arg3 != 0/\n"
+            "{\n"
+            f'    printf("EMK {("%02x" * size)}\\n",\n'
+            f"        {expressions});\n"
+            "}\n"
+        )
+
+    parts = []
+    for function in ("CCCrypt", "CCCryptorCreate"):
+        for size in (16, 32):
+            parts.append(clause(function, size))
+    return "\n".join(parts)
+
+
+def _emoticon_pids(preferred: int) -> list[int]:
+    """表情解密可能在主进程或辅助进程，不只盯一个 PID。"""
+    found: list[int] = []
+    try:
+        listing = subprocess.check_output(["ps", "-ax", "-o", "pid=,command="], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return [preferred] if preferred else []
+    for line in listing.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        name = Path(command.split(" --", 1)[0]).name
+        if name in {"WeChat", "WeChatHelper", "wxplayer", "wxutility"}:
+            try:
+                found.append(int(pid_text))
+            except ValueError:
+                continue
+    if preferred and preferred not in found:
+        found.insert(0, preferred)
+    return found
+
+
+# 监听 16 字节 AES 密钥，并用一整个商店表情包验证。成功后写入 config.json 的 emoticon_key。
+def capture_emoticon_key(pid: int, sample: bytes, duration: float = 60, on_status: Callable[..., object] | None = None) -> bytes | None:
+    import pty
+    import select
+
+    from read_wechat_conversation import decrypt_emoticon_package
+
+    if len(sample) < 16 or len(sample) % 16:
+        raise DTraceError("表情包样本长度不是 16 的倍数")
+    credential_error = ensure_sudo_credentials()
+    if credential_error:
+        raise DTraceError(credential_error)
+    _notify(on_status, "正在监听 16 字节密钥。请打开微信表情面板，点开一套商店表情")
+    seen: set[bytes] = set()
+    deadline = time.monotonic() + duration
+    found: bytes | None = None
+    readers: list[tuple[int, subprocess.Popen[bytes], bytes]] = []
+    errors: list[str] = []
+    for target in _emoticon_pids(pid):
+        master, slave = pty.openpty()
+        process = subprocess.Popen(
+            ["sudo", "-n", "dtrace", "-q", "-n", build_emoticon_dtrace_program(), "-p", str(target)],
+            stdin=subprocess.DEVNULL,
+            stdout=slave,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+        os.close(slave)
+        readers.append((master, process, b""))
+    try:
+        while time.monotonic() < deadline and found is None:
+            alive = [(master, process, pending) for master, process, pending in readers if process.poll() is None or pending]
+            if not alive:
+                break
+            ready, _, _ = select.select([item[0] for item in alive], [], [], 0.5)
+            next_readers: list[tuple[int, subprocess.Popen[bytes], bytes]] = []
+            for master, process, pending in readers:
+                if master not in ready:
+                    next_readers.append((master, process, pending))
+                    continue
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    chunk = b""
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    text = line.decode("utf-8", errors="replace").strip()
+                    match = re.fullmatch(r"EMK ([0-9a-fA-F]{32}|[0-9a-fA-F]{64})", text)
+                    if not match:
+                        continue
+                    candidate = bytes.fromhex(match.group(1))
+                    if candidate in seen:
+                        continue
+                    seen.add(candidate)
+                    if decrypt_emoticon_package(sample, candidate) is not None:
+                        found = candidate
+                        break
+                next_readers.append((master, process, pending))
+                if found is not None:
+                    break
+            readers = next_readers
+    finally:
+        for master, process, _pending in readers:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            if process.stderr is not None:
+                detail = process.stderr.read().decode("utf-8", errors="replace").strip()
+                if detail:
+                    errors.append(detail[:300])
+            os.close(master)
+    if found is None and not seen and errors:
+        raise DTraceError(errors[0])
+    if found is None:
+        raise DTraceError(f"看到 {len(seen)} 个 16 字节候选，没有一把能解开商店表情包。请在采集过程中打开表情面板。")
+    config_path = Path(__file__).resolve().parent / "config.json"
+    payload: dict[str, object] = {}
+    if config_path.is_file():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except json.JSONDecodeError:
+            payload = {}
+    payload["emoticon_key"] = found.hex()
+    config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.chmod(config_path, 0o600)
+    return found
+
+
+# 写入仅当前用户可执行的 sudo 密码助手，供没有终端时弹出密码框。
+def ensure_sudo_askpass(directory: Path | None = None) -> Path:
+    folder = directory if directory is not None else default_app_support_dir()
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(folder, 0o700)
+    except OSError:
+        pass
+    path = folder / "sudo-askpass.sh"
+    path.write_text(ASKPASS_SCRIPT, encoding="utf-8")
+    os.chmod(path, 0o700)
+    return path
+
+
+# 让 sudo 在需要密码时调用图形密码框，而不是等待一个可能不存在的终端。
+def sudo_environment(directory: Path | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    env["SUDO_ASKPASS"] = str(ensure_sudo_askpass(directory))
+    return env
+
+
+# 读取子进程输出并脱敏，避免把脚本或异常里的密钥带回界面。
+def _completed_detail(completed: subprocess.CompletedProcess[bytes]) -> str:
+    stdout = completed.stdout.decode(errors="replace") if isinstance(completed.stdout, bytes) else str(completed.stdout or "")
+    stderr = completed.stderr.decode(errors="replace") if isinstance(completed.stderr, bytes) else str(completed.stderr or "")
+    return redact_output((stdout + "\n" + stderr).strip())
+
+
+# 判断当前终端上的 sudo 时间戳是否仍可复用。
+def sudo_timestamp_ready() -> bool:
+    try:
+        completed = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+# 只在缓存失效时询问一次管理员密码。sudo 的凭证按终端保存，后续命令必须留在同一终端会话里。
+def ensure_sudo_credentials() -> str | None:
+    if sudo_timestamp_ready():
+        return None
+    try:
+        completed = subprocess.run(
+            ["sudo", "-A", "-v"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            env=sudo_environment(),
+            timeout=PROBE_CHECK_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "等待管理员密码超时。请在弹出的密码框中输入开机密码后重试。"
+    except OSError:
+        return "无法启动 sudo"
+    if completed.returncode != 0:
+        return _completed_detail(completed) or "管理员密码未通过"
+    if not sudo_timestamp_ready():
+        return "管理员密码已输入，但 sudo 没有留下可复用的凭证。请在启动本程序的终端执行 sudo -v 后重试。"
+    return None
+
+
 # 检查当前平台是否具备采集密钥的进程访问条件。
-def check_capture_probe(pid: int, timeout: float = 8.0) -> tuple[bool, str]:
+def check_capture_probe(pid: int, timeout: float = PROBE_CHECK_TIMEOUT) -> tuple[bool, str]:
     if sys.platform == "darwin":
         return check_dtrace_probe(pid, timeout)
     return False, "macOS 以外请使用 python main.py extract-keys"
 
 
-# 运行题目要求的 DTrace probe 列表检查，并返回脱敏后的诊断文本。
-def check_dtrace_probe(pid: int, timeout: float = 8.0) -> tuple[bool, str]:
-    command = ["sudo", "dtrace", "-l", "-n", PROBE_SPEC, "-p", str(int(pid))]
+# 运行 DTrace probe 列表检查，并返回脱敏后的诊断文本。
+def check_dtrace_probe(pid: int, timeout: float = PROBE_CHECK_TIMEOUT) -> tuple[bool, str]:
+    credential_error = ensure_sudo_credentials()
+    if credential_error:
+        return False, credential_error
+    command = ["sudo", "-n", "dtrace", "-l", "-n", PROBE_SPEC, "-p", str(int(pid))]
     try:
-        completed = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "DTrace 检查超时。请在弹出的密码框中输入开机密码；如果没有密码框，请在启动本程序的终端执行 sudo -v 后重试。"
+    except OSError:
         return False, "无法启动 DTrace probe 检查"
     stdout = completed.stdout.decode(errors="replace") if isinstance(completed.stdout, bytes) else str(completed.stdout)
     stderr = completed.stderr.decode(errors="replace") if isinstance(completed.stderr, bytes) else str(completed.stderr)
@@ -403,26 +629,62 @@ def _notify(callback: Callable[..., object] | None, *args: object) -> None:
         pass
 
 
-# 终止 DTrace 子进程并等待其释放资源。
+# 列出某个进程的全部后代，不包含调用方自己的进程组。
+def _descendant_pids(pid: int) -> list[int]:
+    try:
+        completed = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    descendants: list[int] = []
+    for token in completed.stdout.split():
+        try:
+            child = int(token)
+        except ValueError:
+            continue
+        descendants.extend(_descendant_pids(child))
+        descendants.append(child)
+    return descendants
+
+
+# 向一个进程发信号，进程已经退出时忽略错误。
+def _signal_pid(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+# 终止 sudo 和它启动的 dtrace，不能新建会话，否则 sudo 凭证缓存会失效。
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
+    descendants = _descendant_pids(process.pid)
+    for pid in descendants:
+        _signal_pid(pid, signal.SIGINT)
+    _signal_pid(process.pid, signal.SIGINT)
     try:
-        process_group = os.getpgid(process.pid)
-        if process_group != os.getpgrp():
-            os.killpg(process_group, signal.SIGINT)
-        else:
-            process.send_signal(signal.SIGINT)
         process.wait(timeout=3)
-    except (AttributeError, TypeError, OSError, subprocess.TimeoutExpired):
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    for pid in descendants:
+        _signal_pid(pid, signal.SIGTERM)
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        for pid in descendants:
+            _signal_pid(pid, signal.SIGKILL)
         try:
-            process.terminate()
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                process.kill()
-            except OSError:
-                pass
+            process.kill()
+        except OSError:
+            pass
 
 
 # macOS 用 DTrace 采集密钥。Linux / Windows 走 main.py。
@@ -473,15 +735,18 @@ def _capture_keys_dtrace(
     process_exited_early = False
     error: str | None = None
     returncode: int | None = None
+    credential_error = ensure_sudo_credentials()
+    if credential_error:
+        return CaptureResult((), (), 0.0, None, credential_error)
     try:
-        command = ["sudo", "dtrace", "-q", "-n", build_dtrace_program(), "-p", str(int(pid))]
+        # 不使用 start_new_session。sudo 默认按终端缓存密码，新会话没有终端，会再次弹出密码框。
+        command = ["sudo", "-n", "dtrace", "-q", "-n", build_dtrace_program(), "-p", str(int(pid))]
         _notify(on_status, "正在启动 DTrace 密钥采集")
         process = subprocess.Popen(
             command,
-            stdin=None,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
         )
         if process.stdout is None or process.stderr is None:
             raise DTraceError("DTrace 输出通道不可用")
@@ -548,7 +813,7 @@ def _capture_keys_dtrace(
             _stop_process(process)
             returncode = process.returncode
             if error is None and process_exited_early and returncode not in (None, 0):
-                error = "; ".join(stderr_details[-3:]) or "DTrace 密钥采集进程异常退出"
+                error = "\n".join(stderr_details) or "DTrace 密钥采集进程异常退出"
         _notify(on_tick, 0)
     elapsed = time.monotonic() - started
     return CaptureResult(tuple(candidates), tuple(validated_records), elapsed, returncode, error)
@@ -682,6 +947,8 @@ __all__ = [
     "default_key_path",
     "detect_wechat",
     "ensure_key_path_outside_export",
+    "ensure_sudo_askpass",
+    "ensure_sudo_credentials",
     "find_wechat_pid",
     "get_capture_prerequisite",
     "get_wechat_pid",

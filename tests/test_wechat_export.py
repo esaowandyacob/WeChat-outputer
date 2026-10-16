@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import io
 import os
 import sqlite3
+import subprocess
 import tkinter as tk
 import wave
 from pathlib import Path
@@ -14,12 +16,16 @@ import pytest
 
 from app import EXPORT_COLORS, WeChatExportApp
 from cccryptor_probe import (
+    PROBE_SPEC,
     KeyRecord,
     build_dtrace_program,
     default_key_path,
+    ensure_sudo_askpass,
+    ensure_sudo_credentials,
     load_key_records,
     mask_key,
     save_key_records,
+    sudo_environment,
 )
 from read_wechat_conversation import (
     Conversation,
@@ -32,8 +38,12 @@ from read_wechat_conversation import (
     export_html,
     export_sqlite,
     export_text,
+    parse_message_row,
     find_sqlcipher_driver,
+    local_media_files,
+    local_media_path,
     open_database_backend,
+    preferred_display_name,
 )
 
 
@@ -144,13 +154,199 @@ def test_sqlcipher_raw_key_roundtrip(tmp_path: Path) -> None:
     assert reader.validate_key(key) == ("message_0.db",)
 
 
+# 验证图形密码助手只存在于用户目录，并且不会把密码写进脚本。
+def test_sudo_askpass_script_is_private(tmp_path: Path) -> None:
+    path = ensure_sudo_askpass(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    assert path.stat().st_mode & 0o777 == 0o700
+    assert "display dialog" in text
+    assert "with hidden answer" in text
+    assert "password" not in text.lower()
+    env = sudo_environment(tmp_path)
+    assert env["SUDO_ASKPASS"] == str(path)
+
+
 # 验证 DTrace 脚本固定输出 32 个字节且包含精确过滤条件。
 def test_dtrace_program_is_literal_and_filtered() -> None:
     program = build_dtrace_program()
+    description = program.splitlines()[0]
+    assert description == PROBE_SPEC
+    assert description.count(":") == 3
     assert program.count("%02x") == 32
     assert "arg1 == 0" in program
     assert "arg4 == 32" in program
     assert '"%02x" * 32' not in program
+
+
+# 验证管理员密码只在 sudo 缓存失效时询问一次。
+def test_sudo_credentials_reuse_timestamp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    cache_ready = {"value": False}
+
+    # 用假的 sudo 记录命令，并在第一次 -v 之后把缓存标记为可用。
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(list(command))
+        if command == ["sudo", "-n", "true"]:
+            code = 0 if cache_ready["value"] else 1
+            return subprocess.CompletedProcess(command, code, b"", b"" if code == 0 else b"a password is required")
+        if command == ["sudo", "-A", "-v"]:
+            assert kwargs.get("env", {}).get("SUDO_ASKPASS") == str(tmp_path / "askpass")
+            cache_ready["value"] = True
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+        raise AssertionError(command)
+
+    monkeypatch.setattr("cccryptor_probe.subprocess.run", fake_run)
+    monkeypatch.setattr("cccryptor_probe.sudo_environment", lambda directory=None: {"SUDO_ASKPASS": str(tmp_path / "askpass")})
+    assert ensure_sudo_credentials() is None
+    assert ensure_sudo_credentials() is None
+    assert calls == [
+        ["sudo", "-n", "true"],
+        ["sudo", "-A", "-v"],
+        ["sudo", "-n", "true"],
+        ["sudo", "-n", "true"],
+    ]
+    assert calls.count(["sudo", "-A", "-v"]) == 1
+
+
+# 验证超长的伪路径不会报错，真实媒体按 md5 路径读出。
+def test_local_media_path_skips_overlong_names(tmp_path: Path) -> None:
+    note = tmp_path / "note.txt"
+    note.write_text("hi", encoding="utf-8")
+    assert local_media_path({"media_path": "note.txt"}, tmp_path) == note.resolve()
+    assert local_media_path({"media_path": "a" * 300}, tmp_path) is None
+    assert local_media_path({"message_content": f"<cdnthumburl>{'ab' * 200}</cdnthumburl>"}, tmp_path) is None
+    media_md5 = "ab" * 16
+    talker = "wxid_friend"
+    month = datetime.datetime.fromtimestamp(1_700_000_000).strftime("%Y-%m")
+    image = tmp_path / "msg" / "attach" / hashlib.md5(talker.encode()).hexdigest() / month / "Img" / f"{media_md5}.dat"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\xff\xd8\xff\xd9")
+    found = local_media_files(
+        {"local_type": 3, "create_time": 1_700_000_000, "packed_info_data": media_md5.encode()},
+        tmp_path,
+        talker,
+    )
+    assert found == [image.resolve()]
+    media_md5 = "cd" * 16
+    month = datetime.datetime.fromtimestamp(1_700_000_000).strftime("%Y-%m")
+    video_dir = tmp_path / "msg" / "video" / month
+    video_dir.mkdir(parents=True)
+    movie = video_dir / f"{media_md5}.mp4"
+    thumb = video_dir / f"{media_md5}_thumb.jpg"
+    movie.write_bytes(b"mp4")
+    thumb.write_bytes(b"jpg")
+    videos = local_media_files(
+        {"local_type": 43, "create_time": 1_700_000_000, "packed_info_data": media_md5.encode()},
+        tmp_path,
+        talker,
+    )
+    assert videos == [movie.resolve()]
+    emoji_md5 = "ef" * 16
+    emoji = tmp_path / "cache" / "2024-01" / emoji_md5
+    emoji.parent.mkdir(parents=True)
+    emoji.write_bytes(b"GIF89a")
+    emojis = local_media_files(
+        {
+            "local_type": 47,
+            "create_time": 1_700_000_000,
+            "message_content": f'<emoji md5="{emoji_md5}"></emoji>',
+        },
+        tmp_path,
+        talker,
+    )
+    assert emojis == [emoji.resolve()]
+
+
+# 验证账号自己显示为“我”，对方仍用当前库的 Name2Id，而不是别的库里的同号发送者。
+def test_account_owner_is_me_and_peer_uses_local_name2id() -> None:
+    contacts = {
+        "wxid_eahb9kfz0eaq22": {"nick_name": "夜航星"},
+        "wxid_friend": {"nick_name": "BOOK", "remark": "宇文"},
+    }
+    mine = parse_message_row(
+        {"real_sender_id": 3, "local_id": 1, "create_time": 1_700_000_000, "local_type": 1, "message_content": "你好"},
+        "wxid_friend",
+        contacts=contacts,
+        sender_resource={3: "wxid_eahb9kfz0eaq22"},
+        self_wxid="wxid_eahb9kfz0eaq22_a9d3",
+    )
+    peer = parse_message_row(
+        {"real_sender_id": 27, "local_id": 2, "create_time": 1_700_000_010, "local_type": 1, "message_content": "在吗"},
+        "wxid_friend",
+        contacts=contacts,
+        sender_resource={27: "wxid_friend"},
+        self_wxid="wxid_eahb9kfz0eaq22_a9d3",
+    )
+    assert mine.sender_name == "我"
+    assert peer.sender_name == "BOOK（宇文）"
+    # 正文里偶然出现的“名字:”不能把发送者改成别人。
+    mistaken = parse_message_row(
+        {
+            "real_sender_id": 27,
+            "local_id": 3,
+            "create_time": 1_700_000_020,
+            "local_type": 1,
+            "message_content": "wxid_other:\n这不是那个人发的",
+        },
+        "wxid_friend",
+        contacts=contacts,
+        sender_resource={27: "wxid_friend"},
+        self_wxid="wxid_eahb9kfz0eaq22_a9d3",
+    )
+    assert mistaken.sender_wxid == "wxid_friend"
+    assert mistaken.content == "wxid_other:\n这不是那个人发的"
+
+
+# 验证再次导出 HTML 会换掉目录里上一次的页面和 media。
+def test_html_export_overwrites_previous_files(tmp_path: Path) -> None:
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "old.png").write_bytes(b"old")
+    (tmp_path / "index.html").write_text("old", encoding="utf-8")
+    conversation = Conversation("wxid_friend", "好友", "", "", "single", "wxid_friend", "好友")
+    message = MessageRecord(1, "s1", "2026-01-01 00:00:00", "wxid_friend", "好友", 1, "你好")
+    export_html(build_memory_model(conversation, [message]), tmp_path)
+    text = (tmp_path / "index.html").read_text(encoding="utf-8")
+    assert "你好" in text
+    assert not (media / "old.png").exists()
+
+
+# 验证显示名保留原名，并在有不同备注时追加括号。
+def test_display_name_appends_remark() -> None:
+    assert preferred_display_name("wxid_a", {"nick_name": "张三", "remark": "同事"}) == "张三（同事）"
+    assert preferred_display_name("wxid_a", {"nick_name": "张三", "remark": "张三"}) == "张三"
+    assert preferred_display_name("wxid_a", {"nick_name": "张三", "remark": ""}) == "张三"
+    assert preferred_display_name(
+        "123@chatroom",
+        {"nick_name": "项目群", "remark": "工作"},
+        {},
+    ) == "项目群（工作）"
+
+
+# 验证没有联系人库时，会话列表仍能用 Name2Id 显示微信 ID、时间和最新消息。
+def test_conversation_list_resolves_name2id_preview(tmp_path: Path) -> None:
+    conversation_id = "wxid_friend"
+    table = "Msg_" + hashlib.md5(conversation_id.encode()).hexdigest()
+    message_dir = tmp_path / "message"
+    message_dir.mkdir()
+    message_db = message_dir / "message_0.db"
+    connection = sqlite3.connect(message_db)
+    connection.execute(
+        f'CREATE TABLE "{table}" (local_id INTEGER, create_time INTEGER, sort_seq INTEGER, local_type INTEGER, message_content TEXT)'
+    )
+    connection.execute(f'INSERT INTO "{table}" VALUES (1, 1700000000, 1, 1, ?)', ("第一条",))
+    connection.execute(f'INSERT INTO "{table}" VALUES (2, 1700000090, 2, 1, ?)', ("最新一条",))
+    connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
+    connection.execute("INSERT INTO Name2Id(user_name) VALUES (?)", (conversation_id,))
+    connection.commit()
+    connection.close()
+    reader = WeChatReader(message_paths=[message_db], key_path=tmp_path / "keys.json")
+    conversations = reader.list_conversations(["0" * 64])
+    assert [item.conversation_id for item in conversations] == [conversation_id]
+    assert conversations[0].title == conversation_id
+    assert conversations[0].recent_message == "最新一条"
+    assert conversations[0].recent_time
+    assert reader.names_resolved is False
 
 
 # 验证读取器发现会话、解析链接卡片和提取 VoiceInfo 音频。
@@ -158,7 +354,7 @@ def test_reader_parses_fixture(tmp_path: Path) -> None:
     reader, conversation_id, voice_data = make_fixture(tmp_path)
     conversations = reader.list_conversations(["0" * 64])
     assert len(conversations) == 1
-    assert conversations[0].title == "好友昵称"
+    assert conversations[0].title == "好友昵称（不应优先）"
     model = reader.read_conversation(conversation_id, ["0" * 64])
     assert model["meta"]["message_count"] == 3
     assert model["messages"][1]["link_url"] == "https://example.com/a"
@@ -227,6 +423,23 @@ def test_gui_buttons_create_and_restore() -> None:
             assert button.cget("bg") == original
             assert button.normal_background == EXPORT_COLORS[key][0]
         assert tuple(app.conversation_tree["columns"]) == ("recent_time", "title", "recent_message")
+        assert str(app.conversation_tree["selectmode"]) == "extended"
+        app._conversations_loaded(
+            [
+                Conversation("wxid_a", "甲", "t1", "m1"),
+                Conversation("wxid_b", "乙", "t2", "m2"),
+            ],
+            None,
+        )
+        app._select_all_conversations()
+        assert [item.conversation_id for item in app._selected_conversations()] == ["wxid_a", "wxid_b"]
+        app._clear_conversation_selection()
+        assert app._selected_conversations() == []
+        dialog = app._show_copyable_dialog("采集失败", "Overspecified probe description")
+        assert dialog.title() == "采集失败"
+        assert "Overspecified probe description" in dialog.result_text.get("1.0", "end")
+        dialog.copy_button.invoke()
+        assert app.clipboard_get() == "Overspecified probe description"
     finally:
         app.destroy()
 

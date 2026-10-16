@@ -41,12 +41,22 @@ python -m pip install -r requirements.txt
 1. 在“系统设置 → 隐私与安全性 → 完全磁盘访问权限”中给 Terminal 或 Python 授权。
 2. DTrace 需要关闭 SIP：恢复模式终端执行 `csrutil disable` 后重启。程序不会改 SIP。
 3. 启动并登录微信，然后运行 `python app.py`。
-4. 点击“启动采集”。60 秒内登录或打开几个会话。验证通过的密钥写入
+4. 点击“启动采集”。弹出密码框时输入一次开机密码，同一终端里短时间内会复用 sudo 缓存。60 秒内登录或打开几个会话。验证通过的密钥写入
    `~/Library/Application Support/WeChatExport/wechat_cccryptor_keys.json`。
 5. 选择会话后导出。HTML 生成 `index.html` 和 `media/`，纯文本生成 `chat.txt`，
    SQLite 仅在点击“导出 SQLite”时生成 `chat.sqlite`。
 
 找不到数据库时，在界面选择数据目录，或设置 `WECHAT_DATA_ROOT`。
+
+图片和表情：
+
+- V2 图片密钥由 `Documents/app_data/**/kvcomm/key_<code>_*.statistic` 里的 code 和 wxid 推导：
+  `md5(code + wxid)` 前 16 位十六进制字符为 AES 密钥，`code & 0xFF` 为尾段 XOR 密钥。导出时自动推导并写入
+  `config.json`，也可以点“采集图片密钥”。推导结果会先用本地图片验证。
+- 部分图片是微信的 `wxgf`（HEVC）格式，需要 `ffmpeg` 转成 JPEG：`brew install ffmpeg`。
+- 本地表情缓存用的是另一把未公开的密钥。导出时按消息里的 `cdnurl` / `encrypturl` 从微信 CDN
+  下载表情，缓存到 `~/Library/Application Support/WeChatExport/emoji_cache/`。只请求 `*.qq.com`、
+  `*.qpic.cn` 地址。不想联网时设置 `WECHAT_EXPORT_OFFLINE=1`，表情只显示 `[表情]`。
 
 ## Linux / Windows
 

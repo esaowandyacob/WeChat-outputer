@@ -145,6 +145,22 @@ def cmd_extract_image_key(_args):
     """提取 V2 图片密钥（需 sudo；密钥仅在微信查看图片时加载进内存）。"""
     if sys.platform == "win32":
         sys.exit("[ERR] extract-image-key 目前仅支持 Linux")
+    if sys.platform == "darwin":
+        from wxwatch.imagekey import capture_image_key_macos
+        from cccryptor_probe import detect_wechat
+        from read_wechat_conversation import WeChatReader
+
+        status = detect_wechat()
+        if not status.running or status.pid is None:
+            sys.exit("[ERR] 请先启动并登录微信，再全屏打开几张照片")
+        root = WeChatReader().catalog().account_root
+        if root is None:
+            sys.exit("[ERR] 未找到微信数据目录")
+        print("[*] 先按本机微信配置推导图片密钥；推导失败时请在 60 秒内全屏打开 2 到 3 张照片")
+        found = capture_image_key_macos(status.pid, root, on_status=print)
+        if not found:
+            sys.exit("[ERR] 未采到图片密钥")
+        return
     if os.geteuid() != 0:
         sys.exit("[ERR] 需要 root：sudo .venv/bin/python main.py extract-image-key\n"
                  "      注意：先在微信里点开一张图片，再立即运行本命令")
