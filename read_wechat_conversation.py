@@ -27,7 +27,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 import wave
 import zlib
 from dataclasses import dataclass, field
@@ -1774,6 +1776,21 @@ def _browser_video_bytes(path: Path) -> bytes:
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
         return original
+    from wxwatch.imagedat import _write_atomic
+
+    # 转码结果按源文件路径、大小和修改时间缓存。再次导出同一会话时不用重新转码。
+    cache_dir = _media_cache_dir()
+    try:
+        stat = path.stat()
+        cache_key = hashlib.sha256(f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()).hexdigest()
+    except OSError:
+        return original
+    converted = cache_dir / f"video_{cache_key}.mp4"
+    unchanged = cache_dir / f"video_{cache_key}.h264"
+    if unchanged.exists():
+        return original
+    with contextlib.suppress(OSError):
+        return converted.read_bytes()
     probe = subprocess.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
         capture_output=True,
@@ -1782,20 +1799,38 @@ def _browser_video_bytes(path: Path) -> bytes:
     )
     codec = probe.stdout.strip().lower()
     if codec in {"", "h264"}:
+        if codec:
+            _write_atomic(unchanged, b"")
         return original
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
         target = Path(handle.name)
     try:
+        # veryfast 比默认的 medium 快好几倍，聊天视频的画质差别看不出来。
         result = subprocess.run(
-            [ffmpeg, "-y", "-i", str(path), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(target)],
+            [ffmpeg, "-y", "-i", str(path), "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-movflags", "+faststart", str(target)],
             capture_output=True,
             check=False,
         )
         if result.returncode != 0 or not target.is_file():
             return original
-        return target.read_bytes()
+        data = target.read_bytes()
     finally:
         target.unlink(missing_ok=True)
+    _write_atomic(converted, data)
+    return data
+
+
+# 转码缓存放在应用数据目录，只有当前用户可读。
+def _media_cache_dir() -> Path:
+    from cccryptor_probe import default_app_support_dir
+
+    return default_app_support_dir() / "media_cache"
+
+
+# 媒体处理基本都在等 ffmpeg 子进程或网络，用线程并行。
+MEDIA_WORKERS = max(2, min(8, os.cpu_count() or 4))
+_IMAGE_KEY_LOCK = threading.Lock()
 
 
 _IMAGE_KEY_DERIVED: set[str] = set()
@@ -1825,16 +1860,23 @@ def _decode_wechat_dat(path: Path) -> bytes | None:
         return decoded
     # macOS 的图片密钥可以从本机微信配置推导。密钥缺失或换了账号时推导一次并写回 config.json。
     account_root = _account_root_of(path)
-    if account_root is None or str(account_root) in _IMAGE_KEY_DERIVED:
+    if account_root is None:
         return None
-    _IMAGE_KEY_DERIVED.add(str(account_root))
-    try:
-        from wxwatch.imagekey import ensure_image_key_macos
+    # 并行导出时只让一个线程推导并写 config.json，其余线程等它写完再读。
+    with _IMAGE_KEY_LOCK:
+        if str(account_root) not in _IMAGE_KEY_DERIVED:
+            _IMAGE_KEY_DERIVED.add(str(account_root))
+            try:
+                from wxwatch.imagekey import ensure_image_key_macos
 
-        if not ensure_image_key_macos(account_root):
-            return None
-        image_key, xor_key = load_image_keys(config_path)
-        return decode_dat(path, image_key, xor_key)
+                ensure_image_key_macos(account_root)
+            except Exception:
+                return None
+    retry_key, retry_xor = load_image_keys(config_path)
+    if retry_key is None or (retry_key, retry_xor) == (image_key, xor_key):
+        return None
+    try:
+        return decode_dat(path, retry_key, retry_xor)
     except Exception:
         return None
 
@@ -1959,118 +2001,6 @@ def load_emoticon_index(backends: Iterable[DatabaseBackend]) -> dict[str, dict[s
     return index
 
 
-# 商店表情没有下载地址。md5 -> 所在安装包、解密后的偏移和长度。
-def load_store_emoticon_index(backends: Iterable[DatabaseBackend]) -> dict[str, dict[str, int | str]]:
-    index: dict[str, dict[str, int | str]] = {}
-    for database in backends:
-        if "kStoreEmoticonFilesTable" not in table_names(database):
-            continue
-        try:
-            rows = database.query(
-                "SELECT md5_, package_id_, emoticon_offset_, emoticon_size_ FROM kStoreEmoticonFilesTable"
-            )
-        except DatabaseQueryError:
-            continue
-        for row in rows:
-            md5_hex = text_value(row_value(row, "md5_")).casefold()
-            package_id = text_value(row_value(row, "package_id_"))
-            if not re.fullmatch(r"[0-9a-f]{32}", md5_hex) or not package_id:
-                continue
-            index[md5_hex] = {
-                "package_id": package_id,
-                "offset": integer_id(row_value(row, "emoticon_offset_"), 0),
-                "size": integer_id(row_value(row, "emoticon_size_"), 0),
-            }
-    return index
-
-
-# 安装包是整文件 AES。表里的偏移指向解密并去掉填充之后的字节。
-def decrypt_emoticon_package(data: bytes, key: bytes) -> bytes | None:
-    if len(key) not in {16, 24, 32} or len(data) < 16 or len(data) % 16:
-        return None
-    from Crypto.Cipher import AES
-    from Crypto.Util import Padding
-
-    modes = [
-        AES.new(key, AES.MODE_ECB),
-        AES.new(key, AES.MODE_CBC, iv=key[:16]),
-        AES.new(key, AES.MODE_CBC, iv=b"\x00" * 16),
-    ]
-    for cipher in modes:
-        try:
-            decrypted = cipher.decrypt(data)
-        except ValueError:
-            continue
-        candidates = [decrypted]
-        try:
-            candidates.insert(0, Padding.unpad(decrypted, 16))
-        except ValueError:
-            pass
-        for plain in candidates:
-            if any(magic in plain[:64] for magic in _EMOJI_MAGICS):
-                return plain
-    return None
-
-
-def _emoticon_key() -> bytes | None:
-    config_path = Path(__file__).resolve().parent / "config.json"
-    if not config_path.is_file():
-        return None
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8")).get("emoticon_key")
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(raw, str) or not re.fullmatch(r"[0-9a-fA-F]{32,64}", raw):
-        return None
-    return bytes.fromhex(raw)
-
-
-_STORE_PACKAGE_PLAIN: dict[str, bytes] = {}
-
-
-# 从商店表情安装包里切出一张表情。密钥还没采到时返回 None。
-def extract_store_emoji(
-    account_root: Path,
-    md5_hex: str,
-    store_index: Mapping[str, Mapping[str, int | str]] | None,
-) -> Path | None:
-    record = (store_index or {}).get(md5_hex)
-    key = _emoticon_key()
-    if record is None or key is None:
-        return None
-    package_id = str(record["package_id"])
-    offset = int(record["offset"])
-    size = int(record["size"])
-    if size <= 0 or offset < 0:
-        return None
-    plain = _STORE_PACKAGE_PLAIN.get(package_id)
-    if plain is None:
-        digest = hashlib.md5(package_id.encode("utf-8")).hexdigest()
-        package_path = next(
-            ((account_root / "business" / "emoticon" / "PersistStore").rglob(digest)),
-            None,
-        )
-        if package_path is None or not package_path.is_file():
-            return None
-        try:
-            plain = decrypt_emoticon_package(package_path.read_bytes(), key)
-        except OSError:
-            return None
-        if plain is None:
-            return None
-        _STORE_PACKAGE_PLAIN[package_id] = plain
-    blob = plain[offset:offset + size]
-    if not blob.startswith(_EMOJI_MAGICS):
-        return None
-    cache_dir = _emoji_cache_dir()
-    cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    extension = ".gif" if blob.startswith(b"GIF8") else ".png" if blob.startswith(b"\x89PNG") else ".webp" if blob.startswith(b"RIFF") else ".jpg"
-    target = cache_dir / f"{md5_hex}{extension}"
-    target.write_bytes(blob)
-    (cache_dir / f"{md5_hex}.miss").unlink(missing_ok=True)
-    return target
-
-
 # 只从微信自己的 CDN 下载表情。消息 XML 来自聊天对方，不能按里面的任意地址发请求。
 _EMOJI_HOST_SUFFIXES = (".qq.com", ".qpic.cn", ".wechat.com")
 _EMOJI_MAGICS = (b"GIF8", b"\x89PNG", b"\xff\xd8\xff", b"RIFF", b"wxgf")
@@ -2150,7 +2080,9 @@ def fetch_emoji(content: str, md5_hex: str, fallback: Mapping[str, str] | None =
     (cache_dir / f"{md5_hex}.miss").unlink(missing_ok=True)
     extension = ".gif" if data.startswith(b"GIF8") else ".png" if data.startswith(b"\x89PNG") else ".webp" if data.startswith(b"RIFF") else ".jpg"
     target = cache_dir / f"{md5_hex}{extension}"
-    target.write_bytes(data)
+    from wxwatch.imagedat import _write_atomic
+
+    _write_atomic(target, data)
     return target
 
 
@@ -2176,7 +2108,6 @@ def local_media_files(
     account_root: Path | None,
     conversation_id: str,
     emoji_index: Mapping[str, Mapping[str, str]] | None = None,
-    store_index: Mapping[str, Mapping[str, int | str]] | None = None,
 ) -> list[Path]:
     found: list[Path] = []
     if account_root is None:
@@ -2213,8 +2144,6 @@ def local_media_files(
                 xml_md5 = re.search(r"<emoji\b[^>]*?\bmd5=[\"']([0-9a-fA-F]{32})[\"']", content)
                 emoji_md5 = xml_md5.group(1).lower() if xml_md5 else md5_hex
                 downloaded = fetch_emoji(content, emoji_md5, (emoji_index or {}).get(emoji_md5))
-                if downloaded is None and account_root is not None:
-                    downloaded = extract_store_emoji(account_root, emoji_md5, store_index)
                 if downloaded is not None:
                     return [downloaded]
         elif base_type == 34:
@@ -2234,6 +2163,141 @@ def local_media_files(
     if direct is not None and direct not in found and (not md5_hex or md5_hex in direct.name.casefold()):
         found.append(direct)
     return found
+
+
+# 把账号目录内的已有媒体文件转换成消息媒体记录。进程池要求它是模块级函数。
+def media_records_from_path(message_id: int, path: Path) -> list[MediaRecord]:
+    try:
+        data = _browser_video_bytes(path)
+    except OSError:
+        return []
+    if path.suffix.casefold() == ".dat" or data[:6] in {b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07"}:
+        decoded = _decode_wechat_dat(path)
+        if decoded:
+            extension = ".jpg"
+            mime = "image/jpeg"
+            if decoded.startswith(b"\x89PNG"):
+                extension, mime = ".png", "image/png"
+            elif decoded.startswith(b"GIF8"):
+                extension, mime = ".gif", "image/gif"
+            elif decoded.startswith(b"RIFF"):
+                extension, mime = ".webp", "image/webp"
+            return [
+                MediaRecord(
+                    message_id,
+                    "image",
+                    mime,
+                    f"image_{message_id}{extension}",
+                    decoded,
+                    str(path),
+                    True,
+                )
+            ]
+        # V2 图片没有密钥时仍保存原始 dat，避免这条消息的文件丢失。
+        return [
+            MediaRecord(
+                message_id,
+                "file",
+                "application/octet-stream",
+                f"image_{message_id}.dat",
+                data,
+                str(path),
+                False,
+            )
+        ]
+    if data.startswith(b"\xff\xd8\xff"):
+        mime, media_type, filename = "image/jpeg", "image", f"image_{message_id}.jpg"
+    elif data.startswith(b"\x89PNG"):
+        mime, media_type, filename = "image/png", "image", f"image_{message_id}.png"
+    elif data.startswith(b"GIF8"):
+        mime, media_type, filename = "image/gif", "image", f"image_{message_id}.gif"
+    elif data.startswith(b"RIFF"):
+        mime, media_type, filename = "image/webp", "image", f"image_{message_id}.webp"
+    else:
+        mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        media_type = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "file"
+        filename = safe_filename(path.name, f"media_{message_id}")
+    playable = media_type in {"image", "video"} or mime.casefold() in PLAYABLE_AUDIO_MIMES
+    return [MediaRecord(message_id, media_type, mime, filename, data, str(path), playable)]
+
+
+# 导出时处理媒体的方式。thread 适合大多数情况；process 绕开 GIL，但每个进程要单独建索引、回传大块字节。
+MEDIA_MODES = ("thread", "process", "serial")
+# 上限防止一次拉起太多 ffmpeg 把内存和 CPU 占满。进程比线程重，上限更低。
+MAX_THREAD_WORKERS = 16
+MAX_PROCESS_WORKERS = max(1, min(8, os.cpu_count() or 4))
+
+
+# 按模式把并发数限制在安全范围内。
+def clamp_media_workers(mode: str, workers: int | None) -> int:
+    if mode == "serial":
+        return 1
+    limit = MAX_PROCESS_WORKERS if mode == "process" else MAX_THREAD_WORKERS
+    if workers is None or workers <= 0:
+        workers = MEDIA_WORKERS
+    return max(1, min(int(workers), limit))
+
+
+# 进程池里每个工作进程共用的只读上下文，由 initializer 设置一次。
+_MEDIA_CONTEXT: dict[str, Any] = {}
+
+
+def _init_media_worker(context: dict[str, Any]) -> None:
+    from wxwatch import imagedat
+
+    _MEDIA_CONTEXT.clear()
+    _MEDIA_CONTEXT.update(context)
+    imagedat.CONVERT_CACHE_DIR = context["cache_dir"]
+    account_root = context["account_root"]
+    if account_root is not None:
+        _CACHED_MEDIA_BY_ROOT[str(account_root)] = context["cached_media"]
+
+
+# 读取一条消息的全部本地媒体。线程和进程都调用这个函数。
+def load_message_media(job: tuple[int, Mapping[str, Any]]) -> list[MediaRecord]:
+    message_id, row = job
+    found: list[MediaRecord] = []
+    for candidate_path in local_media_files(
+        row,
+        _MEDIA_CONTEXT["account_root"],
+        _MEDIA_CONTEXT["conversation_id"],
+        _MEDIA_CONTEXT["emoji_index"],
+    ):
+        found.extend(media_records_from_path(message_id, candidate_path))
+    return found
+
+
+# 按选定方式并行读取媒体，结果顺序与 jobs 一致。进程池起不来时退回线程。
+def run_media_jobs(
+    jobs: Sequence[tuple[int, Mapping[str, Any]]],
+    context: dict[str, Any],
+    mode: str = "thread",
+    workers: int | None = None,
+) -> list[list[MediaRecord]]:
+    if mode not in MEDIA_MODES:
+        mode = "thread"
+    count = clamp_media_workers(mode, workers)
+    _init_media_worker(context)
+    if mode == "serial" or count == 1 or len(jobs) < 2:
+        return [load_message_media(job) for job in jobs]
+    if mode == "process":
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
+
+        try:
+            # fork 会复制界面线程和 sqlcipher 连接，macOS 上不安全，统一用 spawn。
+            with ProcessPoolExecutor(
+                max_workers=count,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_media_worker,
+                initargs=(context,),
+            ) as pool:
+                return list(pool.map(load_message_media, jobs, chunksize=max(1, len(jobs) // (count * 8))))
+        except (BrokenProcessPool, OSError, RuntimeError, TypeError, AttributeError):
+            pass
+    with ThreadPoolExecutor(max_workers=count, thread_name_prefix="wechat-media") as pool:
+        return list(pool.map(load_message_media, jobs))
 
 
 # 将消息去重并按原始时间、local_id 稳定排序。
@@ -2603,6 +2667,8 @@ class WeChatReader:
         keys: Iterable[str | KeyRecord] | None = None,
         *,
         recent_days: int | str | None = None,
+        media_mode: str = "thread",
+        media_workers: int | None = None,
     ) -> dict[str, Any]:
         normalized_keys = normalize_reader_keys(keys, self.key_path)
         days = parse_recent_days(recent_days)
@@ -2644,7 +2710,6 @@ class WeChatReader:
                 groups = load_group_records(auxiliary_backends)
                 sender_resource = load_sender_resource_map(auxiliary_backends)
                 emoji_index = load_emoticon_index(auxiliary_backends)
-                store_index = load_store_emoticon_index(auxiliary_backends)
                 if not contacts:
                     contacts = load_contact_records(database for _source, database in message_backends)
                 if not groups:
@@ -2687,6 +2752,7 @@ class WeChatReader:
                 if not selected_tables:
                     raise ReaderError("未找到所选会话对应的消息表")
                 messages: list[MessageRecord] = []
+                media_jobs: list[tuple[MessageRecord, Mapping[str, Any]]] = []
                 cutoff = _dt.datetime.now().timestamp() - days * 86400 if days is not None else None
                 for _source, table, database in selected_tables:
                     try:
@@ -2721,12 +2787,25 @@ class WeChatReader:
                         )
                         if cutoff is not None and message.raw_timestamp and message.raw_timestamp < cutoff:
                             continue
-                        # source 字段是压缩数据，不能当成路径。按媒体 md5 读取真实文件。
-                        for candidate_path in local_media_files(
-                            row, catalog.account_root, str(conversation_id), emoji_index, store_index
-                        ):
-                            message.media.extend(self._media_from_local_path(message.local_id, candidate_path))
+                        media_jobs.append((message, row))
                         messages.append(message)
+                # source 字段是压缩数据，不能当成路径。按媒体 md5 读取真实文件。
+                # 解密、转码、下载表情都在等子进程或网络，按消息并行处理。
+                context = {
+                    "account_root": catalog.account_root,
+                    "conversation_id": str(conversation_id),
+                    "emoji_index": emoji_index,
+                    "cache_dir": _media_cache_dir(),
+                    "cached_media": _cached_media_by_stem(catalog.account_root) if catalog.account_root else {},
+                }
+                results = run_media_jobs(
+                    [(message.local_id, row) for message, row in media_jobs],
+                    context,
+                    media_mode,
+                    media_workers,
+                )
+                for (message, _row), media in zip(media_jobs, results):
+                    message.media.extend(media)
                 messages = deduplicate_messages(messages)
                 media_backends = [
                     backend
@@ -2845,59 +2924,7 @@ class WeChatReader:
 
     # 把账号目录内的已有媒体文件转换成消息媒体记录。
     def _media_from_local_path(self, message_id: int, path: Path) -> list[MediaRecord]:
-        try:
-            data = _browser_video_bytes(path)
-        except OSError:
-            return []
-        if path.suffix.casefold() == ".dat" or data[:6] in {b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07"}:
-            decoded = _decode_wechat_dat(path)
-            if decoded:
-                extension = ".jpg"
-                mime = "image/jpeg"
-                if decoded.startswith(b"\x89PNG"):
-                    extension, mime = ".png", "image/png"
-                elif decoded.startswith(b"GIF8"):
-                    extension, mime = ".gif", "image/gif"
-                elif decoded.startswith(b"RIFF"):
-                    extension, mime = ".webp", "image/webp"
-                return [
-                    MediaRecord(
-                        message_id,
-                        "image",
-                        mime,
-                        f"image_{message_id}{extension}",
-                        decoded,
-                        str(path),
-                        True,
-                    )
-                ]
-            # V2 图片没有密钥时仍保存原始 dat，避免这条消息的文件丢失。
-            return [
-                MediaRecord(
-                    message_id,
-                    "file",
-                    "application/octet-stream",
-                    f"image_{message_id}.dat",
-                    data,
-                    str(path),
-                    False,
-                )
-            ]
-        if data.startswith(b"\xff\xd8\xff"):
-            mime, media_type, filename = "image/jpeg", "image", f"image_{message_id}.jpg"
-        elif data.startswith(b"\x89PNG"):
-            mime, media_type, filename = "image/png", "image", f"image_{message_id}.png"
-        elif data.startswith(b"GIF8"):
-            mime, media_type, filename = "image/gif", "image", f"image_{message_id}.gif"
-        elif data.startswith(b"RIFF"):
-            mime, media_type, filename = "image/webp", "image", f"image_{message_id}.webp"
-        else:
-            mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            media_type = "image" if mime.startswith("image/") else "video" if mime.startswith("video/") else "file"
-            filename = safe_filename(path.name, f"media_{message_id}")
-        playable = media_type in {"image", "video"} or mime.casefold() in PLAYABLE_AUDIO_MIMES
-        return [MediaRecord(message_id, media_type, mime, filename, data, str(path), playable)]
-
+        return media_records_from_path(message_id, path)
 
     # 使用 key 文件验证当前可见的所有消息分片，供 DTrace 回调调用。
     def validate_candidate_key(self, key_hex: str) -> tuple[str, ...]:

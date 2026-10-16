@@ -48,6 +48,10 @@ python -m pip install -r requirements.txt
 
 找不到数据库时，在界面选择数据目录，或设置 `WECHAT_DATA_ROOT`。
 
+导出时“并发方式”控制媒体解密和转码：多线程（默认，上限 16）、多进程（上限为 CPU 核数，最多 8）、单线程。
+HEVC 视频转成 H.264、wxgf 图片转成 JPEG 的结果缓存在 `~/Library/Application Support/WeChatExport/media_cache/`，
+再次导出同一会话时直接复用；占用空间过大时可以整个删掉。
+
 图片和表情：
 
 - V2 图片密钥由 `Documents/app_data/**/kvcomm/key_<code>_*.statistic` 里的 code 和 wxid 推导：

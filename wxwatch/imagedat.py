@@ -15,6 +15,9 @@ import struct
 import subprocess
 from pathlib import Path
 
+# 调用方可设置一个目录缓存 wxgf 转码结果。ffmpeg 每张要几十毫秒，重复导出时直接复用。
+CONVERT_CACHE_DIR: Path | None = None
+
 V1_KEY = b"cfcd208495d565ef"
 V1_MAGIC = b"\x07\x08V1\x08\x07"
 V2_MAGIC = b"\x07\x08V2\x08\x07"
@@ -127,6 +130,15 @@ def wxgf_to_jpeg(data: bytes) -> bytes | None:
     ffmpeg = _ffmpeg_path()
     if start < 0 or ffmpeg is None:
         return None
+    cached: Path | None = None
+    if CONVERT_CACHE_DIR is not None:
+        import hashlib
+
+        cached = Path(CONVERT_CACHE_DIR) / f"wxgf_{hashlib.sha256(data).hexdigest()}.jpg"
+        try:
+            return cached.read_bytes()
+        except OSError:
+            pass
     try:
         completed = subprocess.run(
             [ffmpeg, "-loglevel", "error", "-f", "hevc", "-i", "-", "-frames:v", "1",
@@ -138,7 +150,24 @@ def wxgf_to_jpeg(data: bytes) -> bytes | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return completed.stdout if completed.stdout.startswith(b"\xff\xd8") else None
+    if not completed.stdout.startswith(b"\xff\xd8"):
+        return None
+    if cached is not None:
+        _write_atomic(cached, completed.stdout)
+    return completed.stdout
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """并行导出时多个线程可能写同一个缓存文件，先写临时文件再改名。"""
+    import tempfile
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            handle.write(data)
+        os.replace(handle.name, path)
+    except OSError:
+        pass
 
 
 def load_image_keys(config_path: str | Path) -> tuple[bytes | None, int | None]:

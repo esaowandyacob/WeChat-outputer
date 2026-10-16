@@ -137,27 +137,6 @@ def test_load_emoticon_index(tmp_path):
     assert index == {"ab" * 16: {"cdnurl": "http://a.qq.com/x", "encrypturl": "", "aeskey": ""}}
 
 
-def test_store_emoticon_package_roundtrip() -> None:
-    from Crypto.Cipher import AES
-    from Crypto.Util import Padding
-
-    gif = b"GIF89a" + b"\x02" * 20
-    key = b"0123456789abcdef"
-    package = AES.new(key, AES.MODE_ECB).encrypt(Padding.pad(gif, 16))
-    assert reader.decrypt_emoticon_package(package, key) == gif
-
-
-def test_emoticon_dtrace_listens_for_16_byte_keys() -> None:
-    from cccryptor_probe import build_emoticon_dtrace_program
-
-    program = build_emoticon_dtrace_program()
-    probes = [line for line in program.splitlines() if line.startswith("pid$")]
-    assert probes == ["pid$target:*:CCCrypt:entry", "pid$target:*:CCCrypt:entry", "pid$target:*:CCCryptorCreate:entry", "pid$target:*:CCCryptorCreate:entry"]
-    assert all(line.count(":") == 3 for line in probes)
-    assert "arg4 == 16" in program and "arg4 == 32" in program
-    assert program.count("%02x") == 96
-
-
 SYSMSG_INVITE = """55934890424@chatroom:
 <sysmsg type="sysmsgtemplate">
 <sysmsgtemplate>
@@ -238,3 +217,41 @@ def test_empty_name2id_system_message():
     row = {"local_id": 1, "local_type": 10000, "create_time": 1_700_000_000, "real_sender_id": 7, "message_content": "你已添加了甲"}
     message = reader.parse_message_row(row, "g@chatroom", sender_resource={7: ""})
     assert message.sender_name == "系统"
+
+
+def test_clamp_media_workers():
+    assert reader.clamp_media_workers("serial", 8) == 1
+    assert reader.clamp_media_workers("thread", 999) == reader.MAX_THREAD_WORKERS
+    assert reader.clamp_media_workers("process", 999) == reader.MAX_PROCESS_WORKERS
+    assert reader.clamp_media_workers("thread", 0) == min(reader.MEDIA_WORKERS, reader.MAX_THREAD_WORKERS)
+    assert reader.clamp_media_workers("process", 1) == 1
+
+
+def test_run_media_jobs_modes_agree(tmp_path):
+    import datetime
+
+    talker = "g@chatroom"
+    month = datetime.datetime.fromtimestamp(1_700_000_000).strftime("%Y-%m")
+    image_dir = tmp_path / "msg" / "attach" / hashlib.md5(talker.encode()).hexdigest() / month / "Img"
+    image_dir.mkdir(parents=True)
+    jobs = []
+    for index in range(6):
+        media_md5 = f"{index:032x}"
+        (image_dir / f"{media_md5}.dat").write_bytes(JPEG + bytes([index]))
+        jobs.append((index + 1, {"local_type": 3, "create_time": 1_700_000_000, "packed_info_data": media_md5.encode()}))
+    jobs.append((99, {"local_type": 1, "create_time": 1_700_000_000, "message_content": "hi"}))
+    context = {
+        "account_root": tmp_path,
+        "conversation_id": talker,
+        "emoji_index": {},
+        "cache_dir": tmp_path / "cache",
+        "cached_media": {},
+    }
+
+    def summary(results):
+        return [[(item.message_id, item.filename, item.data) for item in media] for media in results]
+
+    serial = summary(reader.run_media_jobs(jobs, context, "serial"))
+    assert len(serial) == 7 and serial[-1] == [] and serial[0][0][2] == JPEG + b"\x00"
+    assert summary(reader.run_media_jobs(jobs, context, "thread", 4)) == serial
+    assert summary(reader.run_media_jobs(jobs, context, "process", 2)) == serial

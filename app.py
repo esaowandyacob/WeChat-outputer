@@ -27,6 +27,9 @@ from cccryptor_probe import (
     reset_key_file,
 )
 from read_wechat_conversation import (
+    MAX_PROCESS_WORKERS,
+    MAX_THREAD_WORKERS,
+    MEDIA_WORKERS,
     Conversation,
     ReaderError,
     WeChatReader,
@@ -45,19 +48,10 @@ EXPORT_COLORS = {
 }
 
 
+MEDIA_MODE_LABELS = (("thread", "多线程"), ("process", "多进程"), ("serial", "单线程"))
+
+
 # 返回当前平台默认的导出目录。
-def _emoticon_key_status() -> str:
-    config_path = Path(__file__).resolve().parent / "config.json"
-    if not config_path.is_file():
-        return "表情密钥：尚未采集"
-    try:
-        import json
-        saved = json.loads(config_path.read_text(encoding="utf-8")).get("emoticon_key")
-    except (OSError, json.JSONDecodeError):
-        return "表情密钥：尚未采集"
-    return "表情密钥：已保存" if saved else "表情密钥：尚未采集"
-
-
 def _image_key_status() -> str:
     config_path = Path(__file__).resolve().parent / "config.json"
     if not config_path.is_file():
@@ -327,14 +321,6 @@ class WeChatExportApp(tk.Tk):
             button_text="采集图片密钥",
             command=self._start_image_key_capture,
         )
-        self.emoticon_key_var = tk.StringVar(value=_emoticon_key_status())
-        self.emoticon_key_row = self._status_row(
-            frame,
-            self.emoticon_key_var,
-            tk.StringVar(value=""),
-            button_text="采集表情密钥",
-            command=self._start_emoticon_key_capture,
-        )
         path_box = tk.Frame(frame, bg="#FFFFFF", padx=14, pady=12)
         path_box.pack(fill="x", pady=(22, 10))
         tk.Label(path_box, text="密钥文件路径", bg="#FFFFFF", fg="#56606A", font=(UI_FONT, 11)).pack(anchor="w")
@@ -430,6 +416,18 @@ class WeChatExportApp(tk.Tk):
         tk.Label(row, text="最近天数（留空为全部）", bg="#FFFFFF", fg="#56606A").pack(side="left")
         self.recent_days_entry = tk.Entry(row, width=15, relief="solid", bd=1)
         self.recent_days_entry.pack(side="left", padx=14)
+        # 媒体解密、转码的并发方式。上限按模式收紧，防止一次拉起过多 ffmpeg。
+        tk.Label(row, text="并发方式", bg="#FFFFFF", fg="#56606A").pack(side="left", padx=(14, 0))
+        self.media_mode_var = tk.StringVar(value=MEDIA_MODE_LABELS[0][1])
+        mode_menu = tk.OptionMenu(row, self.media_mode_var, *(label for _mode, label in MEDIA_MODE_LABELS), command=self._media_mode_changed)
+        mode_menu.configure(relief="solid", bd=1, highlightthickness=0, bg="#FFFFFF")
+        mode_menu.pack(side="left", padx=8)
+        tk.Label(row, text="数量", bg="#FFFFFF", fg="#56606A").pack(side="left")
+        self.media_workers_var = tk.IntVar(value=min(MEDIA_WORKERS, MAX_THREAD_WORKERS))
+        self.media_workers_spin = tk.Spinbox(
+            row, from_=1, to=MAX_THREAD_WORKERS, width=4, textvariable=self.media_workers_var, relief="solid", bd=1
+        )
+        self.media_workers_spin.pack(side="left", padx=8)
         row2 = tk.Frame(options, bg="#FFFFFF")
         row2.pack(fill="x", pady=(10, 3))
         tk.Label(row2, text="导出目录", bg="#FFFFFF", fg="#56606A").pack(side="left")
@@ -644,50 +642,6 @@ class WeChatExportApp(tk.Tk):
             return
         message = detail or "没有验证通过。请在采集开始后，立刻在微信里全屏打开 2 到 3 张普通照片，不要只发表情。"
         self._show_copyable_dialog("图片密钥未采到", message)
-
-    # 采集商店表情包的 16 字节密钥。数据库采集不会留下这一档。
-    def _start_emoticon_key_capture(self) -> None:
-        if self._worker_busy:
-            return
-        status = detect_wechat()
-        if not status.running or status.pid is None:
-            messagebox.showwarning("需要启动微信", "请先启动并登录微信，再打开表情面板。")
-            return
-        account_root = self.reader.catalog().account_root
-        if account_root is None:
-            self._show_copyable_dialog("采集失败", "没有找到微信数据目录。")
-            return
-        sample = next(((account_root / "business" / "emoticon" / "PersistStore").rglob("*")), None)
-        if sample is None or not sample.is_file():
-            self._show_copyable_dialog("采集失败", "没有找到商店表情安装包，无法验证密钥。")
-            return
-        self._worker_busy = True
-        self.emoticon_key_var.set("⏳ 请打开表情面板，并点开一套已安装的商店表情")
-
-        def worker() -> None:
-            try:
-                from cccryptor_probe import capture_emoticon_key
-
-                found = capture_emoticon_key(
-                    status.pid or 0,
-                    sample.read_bytes(),
-                    on_status=lambda detail: self._post_ui(lambda text=detail: self.emoticon_key_var.set(f"⏳ {text}")),
-                )
-            except Exception as exc:
-                detail = _safe_error_message(exc)
-                self._post_ui(lambda: self._emoticon_key_finished(False, detail))
-                return
-            self._post_ui(lambda: self._emoticon_key_finished(found is not None, ""))
-
-        threading.Thread(target=worker, name="wechat-emoticon-key", daemon=True).start()
-
-    def _emoticon_key_finished(self, found: bool, detail: str) -> None:
-        self._worker_busy = False
-        self.emoticon_key_var.set(_emoticon_key_status() if found else "表情密钥：没有采到")
-        if found:
-            self._show_copyable_dialog("表情密钥已保存", "16 字节表情密钥已写入 config.json。请重新导出，商店表情会从本地安装包里解开。")
-            return
-        self._show_copyable_dialog("表情密钥未采到", detail or "请在采集过程中打开表情面板，并点开一套商店表情。")
 
     # 处理采集线程结束结果并恢复按钮颜色。
     def _capture_finished(self, result: CaptureResult, capture_button: tk.Misc) -> None:
@@ -920,6 +874,7 @@ class WeChatExportApp(tk.Tk):
             return
         try:
             days = parse_recent_days(self.recent_days_entry.get())
+            media_mode, media_workers = self._media_settings()
         except ReaderError as exc:
             self._show_copyable_dialog("输入无效", str(exc))
             return
@@ -950,7 +905,13 @@ class WeChatExportApp(tk.Tk):
                 title = conversation.title
                 self._post_ui(lambda i=index, name=title, count=total: self.export_status_var.set(f"正在导出 {i}/{count}：{name}"))
                 try:
-                    model = self.reader.read_conversation(conversation.conversation_id, self.key_records, recent_days=days)
+                    model = self.reader.read_conversation(
+                        conversation.conversation_id,
+                        self.key_records,
+                        recent_days=days,
+                        media_mode=media_mode,
+                        media_workers=media_workers,
+                    )
                     path = export_model(model, fmt, self._export_directory(conversation, destination, multiple))
                     exported.append(path)
                 except Exception as exc:
@@ -958,6 +919,27 @@ class WeChatExportApp(tk.Tk):
             self._post_ui(lambda: self._export_batch_finished(exported, failures))
 
         threading.Thread(target=worker, name="wechat-export", daemon=True).start()
+
+    # 切换并发方式时同步数量上限，已有的数值超过上限就压下来。
+    def _media_mode_changed(self, _label: str | None = None) -> None:
+        mode, _workers = self._media_settings()
+        limit = 1 if mode == "serial" else MAX_PROCESS_WORKERS if mode == "process" else MAX_THREAD_WORKERS
+        self.media_workers_spin.configure(to=limit, state="disabled" if mode == "serial" else "normal")
+        try:
+            current = int(self.media_workers_var.get())
+        except (tk.TclError, ValueError):
+            current = limit
+        self.media_workers_var.set(max(1, min(current, limit)))
+
+    # 读取界面上的并发方式和数量。数量非法时交给读取层按默认值处理。
+    def _media_settings(self) -> tuple[str, int | None]:
+        label = self.media_mode_var.get()
+        mode = next((mode for mode, text in MEDIA_MODE_LABELS if text == label), "thread")
+        try:
+            workers = int(self.media_workers_var.get())
+        except (tk.TclError, ValueError):
+            workers = None
+        return mode, workers
 
     # 汇总批量导出的成功路径和失败原因。
     def _export_batch_finished(self, exported: list[Path], failures: list[str]) -> None:
@@ -1035,6 +1017,10 @@ class WeChatExportApp(tk.Tk):
 
 # 启动桌面应用主循环。
 def main() -> None:
+    # 进程模式用 spawn 启动子进程。打包成单文件程序后必须先调用它，否则子进程会再开一个界面。
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     if sys.platform != "darwin":
         print(
             "macOS 导出界面只在 Mac 上运行。\n"
