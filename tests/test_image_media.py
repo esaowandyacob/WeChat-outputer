@@ -255,3 +255,35 @@ def test_run_media_jobs_modes_agree(tmp_path):
     assert len(serial) == 7 and serial[-1] == [] and serial[0][0][2] == JPEG + b"\x00"
     assert summary(reader.run_media_jobs(jobs, context, "thread", 4)) == serial
     assert summary(reader.run_media_jobs(jobs, context, "process", 2)) == serial
+
+
+def test_parallel_media_jobs_keep_conversation_context(tmp_path):
+    import datetime
+    from concurrent.futures import ThreadPoolExecutor
+
+    created = 1_700_000_000
+    month = datetime.datetime.fromtimestamp(created).strftime("%Y-%m")
+
+    def one(index: int):
+        root = tmp_path / f"acc{index}"
+        talker = f"user{index}@chatroom"
+        media_md5 = f"{index:032x}"
+        image_dir = root / "msg" / "attach" / hashlib.md5(talker.encode()).hexdigest() / month / "Img"
+        image_dir.mkdir(parents=True)
+        payload = JPEG + bytes([index])
+        (image_dir / f"{media_md5}.dat").write_bytes(payload)
+        context = {
+            "account_root": root,
+            "conversation_id": talker,
+            "emoji_index": {},
+            "cache_dir": root / "cache",
+            "cached_media": {},
+        }
+        jobs = [(index, {"local_type": 3, "create_time": created, "packed_info_data": media_md5.encode()})] * 4
+        results = reader.run_media_jobs(jobs, context, "thread", 4)
+        return [media[0].data if media else b"" for media in results]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(one, (1, 2)))
+    assert first == [JPEG + b"\x01"] * 4
+    assert second == [JPEG + b"\x02"] * 4

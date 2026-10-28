@@ -107,16 +107,24 @@ def _decode_v12(data: bytes, key: bytes, xor_key: int | None = None) -> bytes | 
     return dec_aes + raw_data + dec_xor
 
 
-def _ffmpeg_path() -> str | None:
-    found = shutil.which("ffmpeg")
+def _tool_path(name: str) -> str | None:
+    found = shutil.which(name)
     if found:
         return found
     # 从 Finder 或 IDE 启动时 PATH 里通常没有 Homebrew / MacPorts 目录。
     for folder in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"):
-        candidate = Path(folder) / "ffmpeg"
+        candidate = Path(folder) / name
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
+
+
+def _ffmpeg_path() -> str | None:
+    return _tool_path("ffmpeg")
+
+
+def _ffprobe_path() -> str | None:
+    return _tool_path("ffprobe")
 
 
 def wxgf_to_jpeg(data: bytes) -> bytes | None:

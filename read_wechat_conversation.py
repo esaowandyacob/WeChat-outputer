@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import html
 import importlib
+import io
 import json
 import mimetypes
 import os
@@ -618,13 +619,106 @@ def _scan_message_databases(roots: Iterable[Path]) -> list[Path]:
     return discovered
 
 
+# 账号目录是 wxid_xxx_a9d3，登录目录是 wxid_xxx。两边合成同一个账号键。
+def account_key_from_name(name: str) -> str | None:
+    if not str(name).startswith("wxid_"):
+        return None
+    short, separator, tail = str(name).rpartition("_")
+    if separator and short.startswith("wxid_") and re.fullmatch(r"[0-9a-fA-F]{4}", tail):
+        return short
+    return str(name)
+
+
+# 从路径中的账号目录取出账号键。不在任何 wxid 目录下时返回空。
+def account_key_from_path(path: Path | str) -> str | None:
+    candidate = Path(path)
+    for item in (candidate, *candidate.parents):
+        key = account_key_from_name(item.name)
+        if key:
+            return key
+    return None
+
+
+# 最近一次登录的微信号。Mac 微信同一时间只登录一个号，其余号的库仍留在磁盘上。
+def current_wechat_account_key(home: Path | None = None) -> str | None:
+    home_path = home if home is not None else Path.home()
+    documents = (
+        home_path
+        / "Library"
+        / "Containers"
+        / "com.tencent.xinWeChat"
+        / "Data"
+        / "Documents"
+    )
+    login_dirs = (
+        documents / "xwechat_files" / "all_users" / "login",
+        documents / "app_data" / "login",
+    )
+    best_key: str | None = None
+    best_mtime = -1.0
+    for directory in login_dirs:
+        if not directory.is_dir():
+            continue
+        try:
+            children = list(directory.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            key = account_key_from_name(child.name)
+            if key is None or not child.is_dir():
+                continue
+            try:
+                mtime = child.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > best_mtime:
+                best_mtime = mtime
+                best_key = key
+    return best_key
+
+
+# 同一台 Mac 上每个登录过的号都有一份同群消息。自动扫描时只留当前账号。
+def limit_to_current_account(
+    paths: Sequence[Path],
+    data_root: Path | None = None,
+    home: Path | None = None,
+) -> list[Path]:
+    grouped: dict[str, list[Path]] = {}
+    for path in paths:
+        grouped.setdefault(account_key_from_path(path) or "", []).append(path)
+    if len(grouped) <= 1:
+        return list(paths)
+    explicit = account_key_from_path(data_root) if data_root is not None else None
+    if explicit and explicit in grouped:
+        return grouped[explicit]
+    current = current_wechat_account_key(home)
+    if current and current in grouped:
+        return grouped[current]
+
+    # 认不出登录号时，用最近写过的消息库，避免把所有号的历史拼在一起。
+    def newest(items: Sequence[Path]) -> float:
+        stamps: list[float] = []
+        for item in items:
+            try:
+                stamps.append(item.stat().st_mtime)
+            except OSError:
+                continue
+        return max(stamps, default=0.0)
+
+    chosen = max(grouped, key=lambda key: newest(grouped[key]))
+    return grouped[chosen]
+
+
 # 从给定根目录扫描严格命名为 message_N.db 的消息分片。
 def discover_message_databases(data_root: Path | str | None = None, home: Path | None = None) -> list[Path]:
+    selected_root: Path | None
     if data_root is not None:
-        roots = [Path(data_root).expanduser()]
+        selected_root = Path(data_root).expanduser()
+        roots = [selected_root]
     else:
+        selected_root = None
         roots = default_wechat_data_roots(home)
-    discovered = _scan_message_databases(roots)
+    discovered = limit_to_current_account(_scan_message_databases(roots), selected_root, home)
     return sorted(
         discovered,
         key=lambda item: (str(item.parent), int(MESSAGE_FILE_RE.fullmatch(item.name).group(1) or 0)),
@@ -1194,7 +1288,9 @@ def decode_silk_to_wav(data: bytes) -> bytes | None:
                     output_path.unlink(missing_ok=True)
     except Exception:
         pass
-    ffmpeg = shutil.which("ffmpeg")
+    from wxwatch.imagedat import _ffmpeg_path
+
+    ffmpeg = _ffmpeg_path()
     if not ffmpeg:
         return None
     with tempfile.TemporaryDirectory(prefix="wechat-silk-") as temporary:
@@ -1772,8 +1868,10 @@ def _browser_video_bytes(path: Path) -> bytes:
     original = path.read_bytes()
     if path.suffix.casefold() != ".mp4":
         return original
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
+    from wxwatch.imagedat import _ffmpeg_path, _ffprobe_path
+
+    ffmpeg = _ffmpeg_path()
+    ffprobe = _ffprobe_path()
     if not ffmpeg or not ffprobe:
         return original
     from wxwatch.imagedat import _write_atomic
@@ -1830,7 +1928,10 @@ def _media_cache_dir() -> Path:
 
 # 当前导出使用的缓存目录。进程池的子进程从上下文取，和主进程保持一致。
 def _active_media_cache_dir() -> Path:
-    cache_dir = _MEDIA_CONTEXT.get("cache_dir")
+    local = getattr(_MEDIA_LOCAL, "context", None)
+    cache_dir = local.get("cache_dir") if isinstance(local, Mapping) else None
+    if not cache_dir:
+        cache_dir = _MEDIA_CONTEXT.get("cache_dir")
     return Path(cache_dir) if cache_dir else _media_cache_dir()
 
 
@@ -1947,6 +2048,7 @@ def local_media_path(row: Mapping[str, Any], account_root: Path | None) -> Path 
 
 
 _CACHED_MEDIA_BY_ROOT: dict[str, dict[str, Path]] = {}
+_CACHED_MEDIA_LOCK = threading.Lock()
 
 
 # 只有真实图片、视频，或可解密的 .dat 才挂到消息上。
@@ -1968,21 +2070,25 @@ def _cached_media_by_stem(account_root: Path) -> dict[str, Path]:
     cached = _CACHED_MEDIA_BY_ROOT.get(key)
     if cached is not None:
         return cached
-    index: dict[str, Path] = {}
-    rank = {".jpg": 0, ".jpeg": 0, ".png": 0, ".gif": 0, ".webp": 0, "": 1, ".dat": 2}
-    cache = account_root / "cache"
-    if cache.is_dir():
-        for path in cache.rglob("*"):
-            if not path.is_file():
-                continue
-            stem = path.stem.lower()
-            current = index.get(stem)
-            path_rank = rank.get(path.suffix.lower(), 9)
-            current_rank = rank.get(current.suffix.lower(), 9) if current is not None else 99
-            if current is None or path_rank < current_rank:
-                index[stem] = path
-    _CACHED_MEDIA_BY_ROOT[key] = index
-    return index
+    with _CACHED_MEDIA_LOCK:
+        cached = _CACHED_MEDIA_BY_ROOT.get(key)
+        if cached is not None:
+            return cached
+        index: dict[str, Path] = {}
+        rank = {".jpg": 0, ".jpeg": 0, ".png": 0, ".gif": 0, ".webp": 0, "": 1, ".dat": 2}
+        cache = account_root / "cache"
+        if cache.is_dir():
+            for path in cache.rglob("*"):
+                if not path.is_file():
+                    continue
+                stem = path.stem.lower()
+                current = index.get(stem)
+                path_rank = rank.get(path.suffix.lower(), 9)
+                current_rank = rank.get(current.suffix.lower(), 9) if current is not None else 99
+                if current is None or path_rank < current_rank:
+                    index[stem] = path
+        _CACHED_MEDIA_BY_ROOT[key] = index
+        return index
 
 
 # 读取 emoticon.db 的收藏表情表：md5 -> 下载地址。商店表情只有本地加密包，没有地址。
@@ -2244,33 +2350,64 @@ def clamp_media_workers(mode: str, workers: int | None) -> int:
     return max(1, min(int(workers), limit))
 
 
+# 按 CPU 核数分配会话并发和每个会话里的媒体并发。
+def plan_export_concurrency(conversation_count: int) -> tuple[int, int]:
+    """返回 (conversation_workers, media_workers)。
+
+    单个会话把核数给媒体转码。多个会话时会话线程不超过 4，
+    避免同时复制太多微信数据库；每个会话仍保留媒体线程。
+    """
+    cpu = max(1, os.cpu_count() or 1)
+    count = max(0, int(conversation_count))
+    if count <= 1:
+        return 1, min(MAX_THREAD_WORKERS, cpu)
+    conversation_workers = min(count, max(1, cpu // 2), 4)
+    media_workers = max(1, min(MAX_THREAD_WORKERS, cpu // conversation_workers))
+    return conversation_workers, media_workers
+
+
 # 进程池里每个工作进程共用的只读上下文，由 initializer 设置一次。
 _MEDIA_CONTEXT: dict[str, Any] = {}
+# 线程池不能共用上面的字典：多个会话同时导出时会互相盖掉账号和会话。
+_MEDIA_LOCAL = threading.local()
+
+
+def _bind_media_context(context: Mapping[str, Any]) -> None:
+    _MEDIA_LOCAL.context = context
+    cache_dir = context.get("cache_dir")
+    if cache_dir:
+        from wxwatch import imagedat
+
+        imagedat.CONVERT_CACHE_DIR = cache_dir
 
 
 def _init_media_worker(context: dict[str, Any]) -> None:
-    from wxwatch import imagedat
-
     _MEDIA_CONTEXT.clear()
     _MEDIA_CONTEXT.update(context)
-    imagedat.CONVERT_CACHE_DIR = context["cache_dir"]
-    account_root = context["account_root"]
-    if account_root is not None:
-        _CACHED_MEDIA_BY_ROOT[str(account_root)] = context["cached_media"]
+    _bind_media_context(_MEDIA_CONTEXT)
+    account_root = context.get("account_root")
+    if account_root is not None and "cached_media" in context:
+        with _CACHED_MEDIA_LOCK:
+            _CACHED_MEDIA_BY_ROOT[str(account_root)] = context["cached_media"]
 
 
-# 读取一条消息的全部本地媒体。线程和进程都调用这个函数。
-def load_message_media(job: tuple[int, Mapping[str, Any]]) -> list[MediaRecord]:
-    message_id, row = job
+def _media_from_row(message_id: int, row: Mapping[str, Any], context: Mapping[str, Any]) -> list[MediaRecord]:
+    _bind_media_context(context)
     found: list[MediaRecord] = []
     for candidate_path in local_media_files(
         row,
-        _MEDIA_CONTEXT["account_root"],
-        _MEDIA_CONTEXT["conversation_id"],
-        _MEDIA_CONTEXT["emoji_index"],
+        context.get("account_root"),
+        str(context.get("conversation_id") or ""),
+        context.get("emoji_index"),
     ):
         found.extend(media_records_from_path(message_id, candidate_path))
     return found
+
+
+# 进程池入口。上下文由 initializer 放进 _MEDIA_CONTEXT。
+def load_message_media(job: tuple[int, Mapping[str, Any]]) -> list[MediaRecord]:
+    message_id, row = job
+    return _media_from_row(message_id, row, _MEDIA_CONTEXT)
 
 
 # 按选定方式并行读取媒体，结果顺序与 jobs 一致。进程池起不来时退回线程。
@@ -2283,9 +2420,8 @@ def run_media_jobs(
     if mode not in MEDIA_MODES:
         mode = "thread"
     count = clamp_media_workers(mode, workers)
-    _init_media_worker(context)
     if mode == "serial" or count == 1 or len(jobs) < 2:
-        return [load_message_media(job) for job in jobs]
+        return [_media_from_row(message_id, row, context) for message_id, row in jobs]
     if mode == "process":
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
@@ -2303,7 +2439,7 @@ def run_media_jobs(
         except (BrokenProcessPool, OSError, RuntimeError, TypeError, AttributeError):
             pass
     with ThreadPoolExecutor(max_workers=count, thread_name_prefix="wechat-media") as pool:
-        return list(pool.map(load_message_media, jobs))
+        return list(pool.map(lambda job: _media_from_row(job[0], job[1], context), jobs))
 
 
 # 将消息去重并按原始时间、local_id 稳定排序。
@@ -2363,6 +2499,7 @@ class WeChatReader:
         message_paths: Iterable[Path | str] | None = None,
         database_factory: Callable[[Path, str], DatabaseBackend] | None = None,
         key_path: Path | str = DEFAULT_KEY_PATH,
+        home: Path | str | None = None,
     ) -> None:
         selected_root = data_root if data_root is not None else db_root
         self.data_root = Path(selected_root).expanduser() if selected_root is not None else None
@@ -2371,13 +2508,14 @@ class WeChatReader:
             lambda path, key: open_database_backend(path, key)
         )
         self.key_path = Path(key_path).expanduser()
+        self.home = Path(home).expanduser() if home is not None else None
         self.names_resolved = False
 
     # 发现当前账号的消息、联系人、会话和媒体数据库。
     def catalog(self) -> DatabaseCatalog:
         paths = list(self._message_paths)
         if not paths:
-            paths = discover_message_databases(self.data_root)
+            paths = discover_message_databases(self.data_root, self.home)
         return build_database_catalog(paths)
 
     # 对候选 key 逐个复制并验证，放宽为只要能正确读取任意一个微信数据库即可保留
@@ -3249,6 +3387,19 @@ def write_export_media(
     return by_message, manifest_items
 
 
+_ICON_PATHS = {
+    "image": '<rect x="3.5" y="4.5" width="17" height="15" rx="1.5"/><circle cx="8.5" cy="9" r="1.2"/><path d="M3.5 15.5l5-4 3 2.5 3-2 6 5"/>',
+    "video": '<rect x="3.5" y="5.5" width="17" height="13" rx="1.5"/><path d="M10 9.2v5.6l5.2-2.8z"/>',
+    "voice": '<path d="M5 10v4M9 7v10M13 4v16M17 8v8M21 11v2"/>',
+    "file": '<path d="M7 3.5h7l5 5V20.5H7z"/><path d="M14 3.5V8.5h5"/>',
+    "link": '<path d="M9 15.5l6-7"/><circle cx="8" cy="16.2" r="2.1"/><circle cx="16" cy="7.8" r="2.1"/>',
+}
+
+
+def _inline_icon(name: str) -> str:
+    return f'<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">{_ICON_PATHS[name]}</svg>'
+
+
 # 生成单条消息的安全 HTML 片段，正文和属性全部进行转义。
 def render_message_html(
     message: Mapping[str, Any],
@@ -3284,7 +3435,7 @@ def render_message_html(
             '<a class="link-card" href="'
             + html.escape(link_url, quote=True)
             + '" target="_blank" rel="noopener noreferrer">'
-            + f'<strong>{link_title}</strong>'
+            + f'<strong>{_inline_icon("link")}{link_title}</strong>'
             + (f'<span class="link-description">{link_description}</span>' if link_description else "")
             + (f'<small class="link-source">{link_source}</small>' if link_source else "")
             + "</a>"
@@ -3307,17 +3458,17 @@ def render_message_html(
         elif media_type == "video" and relative:
             body.append(f'<video class="message-video" controls preload="metadata" src="{relative}"></video>')
         elif is_voice:
-            body.append('<span class="media-placeholder">[语音不可播放]</span>')
+            body.append(f'<span class="media-placeholder">{_inline_icon("voice")}语音不可播放</span>')
         elif media_type == "image":
-            body.append('<span class="media-placeholder">[图片不可用]</span>')
+            body.append(f'<span class="media-placeholder">{_inline_icon("image")}图片不可用</span>')
         elif media_type == "video":
-            body.append('<span class="media-placeholder">[视频不可用]</span>')
+            body.append(f'<span class="media-placeholder">{_inline_icon("video")}视频不可用</span>')
         elif relative:
             filename = html.escape(str(item.get("filename", "文件")), quote=True)
-            body.append(f'<a class="media-file" href="{relative}" download>{filename}</a>')
+            body.append(f'<a class="media-file" href="{relative}" download>{_inline_icon("file")}{filename}</a>')
         else:
             filename = html.escape(str(item.get("filename", "文件")))
-            body.append(f'<span class="media-placeholder">[文件：{filename}]</span>')
+            body.append(f'<span class="media-placeholder">{_inline_icon("file")}{filename}</span>')
     if not body:
         body.append('<div class="message-content">[未知消息]</div>')
     return (
@@ -3342,7 +3493,15 @@ def clear_previous_export(destination: Path, names: Iterable[str]) -> None:
             raise ReaderError("无法覆盖已有导出文件") from exc
 
 
-# 导出微信会话为带微信绿主题的 index.html 和 manifest.json。
+def _display_exported_at(value: object) -> str:
+    text = str(value or "")
+    if "T" not in text:
+        return text
+    clock = text.split("+", 1)[0].split("Z", 1)[0].replace("T", " ")
+    return clock[:16]
+
+
+# 导出微信会话为石灰岩底、墨色字的 index.html 和 manifest.json。
 def export_html(model: Mapping[str, Any], output_dir: Path | str) -> Path:
     destination = Path(output_dir).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
@@ -3361,33 +3520,56 @@ def export_html(model: Mapping[str, Any], output_dir: Path | str) -> Path:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
 <style>
-:root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif; }}
-body {{ margin: 0; background: #f5f6f7; color: #1f2329; }}
-.page {{ max-width: 920px; margin: 0 auto; padding: 28px 18px 48px; }}
-h1 {{ color: #07c160; font-size: 25px; margin: 0 0 6px; }}
-.meta {{ color: #7a7f85; font-size: 13px; margin-bottom: 22px; }}
-.message {{ position: relative; background: #fff; border-radius: 12px; box-shadow: 0 1px 3px #0000000d; padding: 14px 16px; margin: 10px 0; }}
-.message header {{ display: flex; gap: 12px; align-items: baseline; margin-bottom: 7px; }}
-.message header strong {{ color: #078a4a; }}
-.message time {{ color: #9aa0a6; font-size: 12px; }}
-.message-content {{ white-space: normal; line-height: 1.65; overflow-wrap: anywhere; }}
-.message-id {{ position: absolute; right: 12px; top: 10px; color: #c4c8cc; font: 11px ui-monospace, monospace; }}
-blockquote {{ border-left: 3px solid #b7e8ce; margin: 8px 0 10px; padding: 6px 11px; color: #697078; background: #f7fbf8; }}
-.quote-sender {{ font-size: 12px; color: #078a4a; margin-bottom: 3px; }}
-.link-card {{ display: flex; flex-direction: column; gap: 5px; border: 1px solid #d7efe1; border-radius: 9px; padding: 11px 13px; color: #1f2329; text-decoration: none; background: #fbfffc; }}
-.link-card:hover {{ border-color: #07c160; background: #f2fff7; }}
-.link-description {{ color: #687078; font-size: 13px; }}
-.link-source {{ color: #9aa0a6; font-size: 12px; }}
-audio, video {{ max-width: 100%; margin-top: 8px; }}
-.message-image {{ max-width: min(520px, 100%); max-height: 520px; border-radius: 8px; margin-top: 8px; }}
-.media-file {{ display: inline-block; color: #078a4a; margin-top: 8px; text-decoration: underline; }}
-.media-placeholder {{ display: inline-block; color: #89919a; background: #f1f3f5; border-radius: 6px; padding: 5px 9px; margin-top: 7px; }}
+:root {{
+  color-scheme: light;
+  --bg: #F3F1ED;
+  --surface: #FBF9F6;
+  --ink: #1C1B19;
+  --muted: #6F6A63;
+  --line: #E4DFD6;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--bg); color: var(--ink); font-size: 15px; line-height: 1.55; -webkit-font-smoothing: antialiased; }}
+.page {{ width: min(760px, 100%); margin: 0 auto; padding: 48px 32px 72px; }}
+h1 {{ margin: 0; font-size: 22px; font-weight: 500; letter-spacing: -0.02em; }}
+.meta {{ margin-top: 8px; color: var(--muted); font-size: 13px; }}
+.transcript {{ margin-top: 28px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }}
+.message {{ position: relative; padding: 16px 20px; border-bottom: 1px solid var(--line); }}
+.message:last-child {{ border-bottom: 0; }}
+.message header {{ display: flex; gap: 10px; align-items: baseline; margin: 0 52px 6px 0; }}
+.message header strong {{ font-size: 13px; font-weight: 600; }}
+.message time {{ color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }}
+.message-content {{ overflow-wrap: anywhere; }}
+.message-id {{ position: absolute; right: 16px; top: 16px; color: #C4BEB6; font: 11px ui-monospace, SFMono-Regular, monospace; }}
+blockquote {{ margin: 8px 0 10px; padding: 0 0 0 12px; border-left: 1px solid #C9C2B8; color: var(--muted); }}
+.quote-sender {{ margin-bottom: 2px; color: var(--ink); font-size: 12px; }}
+.link-card {{ display: flex; flex-direction: column; gap: 4px; margin-top: 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); text-decoration: none; background: var(--bg); }}
+.link-card:hover {{ border-color: #CFC8BE; }}
+.link-card strong {{ display: flex; align-items: center; gap: 8px; font-weight: 600; }}
+.link-description {{ color: var(--muted); font-size: 13px; }}
+.link-source {{ color: var(--muted); font-size: 12px; }}
+.icon {{ width: 14px; height: 14px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }}
+audio {{ width: min(100%, 320px); margin-top: 8px; }}
+video, .message-image {{ display: block; max-width: min(100%, 480px); margin-top: 8px; border-radius: 8px; }}
+video {{ background: var(--ink); }}
+.message-image {{ height: auto; max-height: 480px; }}
+.media-file, .media-placeholder {{ display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; color: var(--muted); font-size: 13px; }}
+.media-file {{ color: var(--ink); text-decoration: none; }}
+.media-file:hover {{ text-decoration: underline; }}
+@media (max-width: 720px) {{
+  .page {{ padding: 28px 16px 48px; }}
+  .message {{ padding: 14px 16px; }}
+  h1 {{ font-size: 20px; }}
+}}
 </style>
 </head>
 <body><main class="page">
 <h1>{html.escape(title)}</h1>
-<div class="meta">消息数：{len(messages)} · 导出时间：{html.escape(str(meta.get("exported_at", "")))}</div>
+<div class="meta">消息数 {len(messages)} · {html.escape(_display_exported_at(meta.get("exported_at", "")))}</div>
+<div class="transcript">
 {rendered}
+</div>
 </main></body></html>
 """
     index_path = destination / "index.html"
@@ -3450,6 +3632,165 @@ def export_text(model: Mapping[str, Any], output_dir: Path | str) -> Path:
         raise ReaderError("拒绝覆盖符号链接形式的文本导出文件")
     text_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return text_path
+
+
+_PDF_FONTS = (
+    Path("/System/Library/Fonts/PingFang.ttc"),
+    Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    Path("/System/Library/Fonts/STHeiti Light.ttc"),
+    Path("/System/Library/Fonts/Supplemental/Songti.ttc"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+    Path("C:/Windows/Fonts/msyh.ttc"),
+    Path("C:/Windows/Fonts/msyh.ttf"),
+    Path("C:/Windows/Fonts/simsun.ttc"),
+)
+
+
+def _pdf_message_content(item: Mapping[str, Any], media_items: list[dict[str, Any]]) -> str:
+    content = str(item.get("content", ""))
+    if content:
+        return content
+    placeholders: list[str] = []
+    for media in media_items:
+        media_type = str(media.get("media_type", "媒体")).casefold()
+        if media_type in {"voice", "audio"}:
+            placeholders.append("[语音通话]")
+        elif media_type == "image":
+            placeholders.append("[图片]")
+        elif media_type == "video":
+            placeholders.append("[视频]")
+        else:
+            filename = safe_filename(str(media.get("filename", "")), "文件")
+            placeholders.append(f"[文件：{filename}]")
+    return " ".join(placeholders) or "[未知消息]"
+
+
+def _pdf_write(pdf: Any, text: str, size: float, color: tuple[int, int, int], line_height: float) -> None:
+    pdf.set_font("CJK", size=size)
+    pdf.set_text_color(*color)
+    remaining = str(text or "").replace("\x00", "")
+    if not remaining:
+        return
+    for _attempt in range(48):
+        try:
+            pdf.multi_cell(0, line_height, remaining, align="L", new_x="LMARGIN", new_y="NEXT")
+            return
+        except Exception as exc:
+            match = re.search(r"index (\d+)", str(exc))
+            if match is None:
+                raise
+            index = int(match.group(1))
+            if index < 0 or index >= len(remaining):
+                raise
+            remaining = remaining[:index] + remaining[index + 1 :]
+            if not remaining:
+                return
+    raise ReaderError("PDF 文本无法写入")
+
+
+def _pdf_image(pdf: Any, data: bytes) -> None:
+    if data.startswith(b"\xff\xd8\xff"):
+        suffix = ".jpg"
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        suffix = ".png"
+    else:
+        return
+    if pdf.get_y() > pdf.h - pdf.b_margin - 40:
+        pdf.add_page()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+        handle.write(data)
+        image_path = Path(handle.name)
+    try:
+        pdf.image(str(image_path), w=90)
+        pdf.ln(2)
+    except Exception:
+        return
+    finally:
+        image_path.unlink(missing_ok=True)
+
+
+# 导出微信会话为 chat.pdf。正文和纯文本一致，JPEG / PNG 会嵌进对应消息。
+def export_pdf(model: Mapping[str, Any], output_dir: Path | str) -> Path:
+    try:
+        from fpdf import FPDF
+    except ImportError as exc:
+        raise ReaderError("缺少 PDF 组件。请回到密钥页，点“一键设置依赖”。") from exc
+    destination = Path(output_dir).expanduser()
+    destination.mkdir(parents=True, exist_ok=True)
+    clear_previous_export(destination, ("chat.pdf",))
+    pdf_path = destination / "chat.pdf"
+    if pdf_path.is_symlink():
+        raise ReaderError("拒绝覆盖符号链接形式的 PDF 导出文件")
+    user_names = model_user_names(model)
+    media_by_message = model_media_by_message(model)
+    messages = [item for item in model.get("messages", []) or [] if isinstance(item, Mapping)]
+    messages.sort(key=lambda item: (str(item.get("sent_at", "")), integer_id(item.get("local_id"), 0)))
+    meta = model.get("meta", {}) if isinstance(model.get("meta", {}), Mapping) else {}
+    title = str(meta.get("conversation_title", meta.get("conversation_id", "微信会话")))
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.set_margins(18, 16, 18)
+    loaded = False
+    font_error: Exception | None = None
+    for font_path in _PDF_FONTS:
+        if not font_path.is_file():
+            continue
+        try:
+            pdf.add_font("CJK", fname=str(font_path))
+            loaded = True
+            break
+        except Exception as exc:
+            font_error = exc
+    if not loaded:
+        if font_error is not None:
+            raise ReaderError("系统中文字体无法用于 PDF") from font_error
+        raise ReaderError("未找到可嵌入的中文字体，无法导出 PDF")
+    pdf.add_page()
+    with contextlib.suppress(Exception):
+        pdf.set_title(title)
+    ink = (28, 27, 25)
+    muted = (111, 106, 99)
+    _pdf_write(pdf, title, 16, ink, 8)
+    _pdf_write(
+        pdf,
+        f"消息数 {len(messages)} · {_display_exported_at(meta.get('exported_at', ''))}",
+        10,
+        muted,
+        6,
+    )
+    pdf.ln(3)
+    for item in messages:
+        local_id = integer_id(item.get("local_id"), 0)
+        sender = user_names.get(integer_id(item.get("sender"), 0), "未知用户")
+        sent_at = str(item.get("sent_at", "")) or "未知时间"
+        media_items = media_by_message.get(local_id, [])
+        _pdf_write(pdf, f"[{sent_at}] {sender}", 11, ink, 6)
+        _pdf_write(pdf, _pdf_message_content(item, media_items), 11, ink, 6)
+        for media in media_items:
+            if str(media.get("media_type", "")).casefold() != "image":
+                continue
+            data = media_bytes(media)
+            if data:
+                _pdf_image(pdf, data)
+        link_url = safe_link_url(item.get("link_url"))
+        if link_url:
+            _pdf_write(pdf, f"链接：{link_url}", 10, muted, 5)
+        if item.get("quote_content") or item.get("quote_sender") is not None:
+            quote_sender = user_names.get(integer_id(item.get("quote_sender"), 0), "未知用户")
+            quote_text = str(item.get("quote_content") or "[原消息内容不可用]")
+            _pdf_write(pdf, f"引用 {quote_sender}：{quote_text}", 10, muted, 5)
+        y = pdf.get_y() + 1.5
+        if y < pdf.h - pdf.b_margin:
+            pdf.set_draw_color(228, 223, 214)
+            pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
+            pdf.ln(4)
+    raw = pdf.output()
+    pdf_path.write_bytes(bytes(raw))
+    return pdf_path
 
 
 # 将规范化模型写入用户明确选择的 chat.sqlite，并执行外键完整性检查。
@@ -3602,6 +3943,8 @@ def export_model(model: Mapping[str, Any], fmt: str, output_dir: Path | str) -> 
         return export_html(model, output_dir)
     if normalized in {"txt", "text", ".txt"}:
         return export_text(model, output_dir)
+    if normalized in {"pdf", ".pdf"}:
+        return export_pdf(model, output_dir)
     if normalized in {"sqlite", "sql", ".sqlite"}:
         return export_sqlite(model, output_dir)
     raise ReaderError("不支持的导出格式")
@@ -3615,6 +3958,11 @@ def export_to_html(model: Mapping[str, Any], output_dir: Path | str) -> Path:
 # 兼容常见调用名称：将模型导出为纯文本。
 def export_to_text(model: Mapping[str, Any], output_dir: Path | str) -> Path:
     return export_text(model, output_dir)
+
+
+# 兼容常见调用名称：将模型导出为 PDF。
+def export_to_pdf(model: Mapping[str, Any], output_dir: Path | str) -> Path:
+    return export_pdf(model, output_dir)
 
 
 # 兼容常见调用名称：将模型导出为 SQLite。
@@ -3664,11 +4012,14 @@ __all__ = [
     "discover_message_databases",
     "export_html",
     "export_model",
+    "export_pdf",
     "export_sqlite",
     "export_text",
     "export_to_html",
+    "export_to_pdf",
     "export_to_sqlite",
     "export_to_text",
+    "plan_export_concurrency",
     "find_message_tables",
     "fetch_message_rows",
     "find_sqlcipher_driver",

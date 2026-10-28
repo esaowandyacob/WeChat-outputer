@@ -43,12 +43,15 @@ python -m pip install -r requirements.txt
 3. 启动并登录微信，然后运行 `python app.py`。
 4. 点击“启动采集”。弹出密码框时输入一次开机密码，同一终端里短时间内会复用 sudo 缓存。60 秒内登录或打开几个会话。验证通过的密钥写入
    `~/Library/Application Support/WeChatExport/wechat_cccryptor_keys.json`。
-5. 选择会话后导出。HTML 生成 `index.html` 和 `media/`，纯文本生成 `chat.txt`，
-   SQLite 仅在点击“导出 SQLite”时生成 `chat.sqlite`。
+5. 选择会话后导出。HTML 生成 `index.html` 和 `media/`，TXT 生成 `chat.txt`，
+   PDF 生成 `chat.pdf`，SQLite 仅在点击“导出 SQLite”时生成 `chat.sqlite`。
+   密钥页的“一键设置依赖”会安装缺失的 Python 包，并在没有 ffmpeg 时执行 `brew install ffmpeg`。
 
 找不到数据库时，在界面选择数据目录，或设置 `WECHAT_DATA_ROOT`。
 
-导出时“并发方式”控制媒体解密和转码：多线程（默认，上限 16）、多进程（上限为 CPU 核数，最多 8）、单线程。
+导出并发按本机 CPU 自动计算，不用再选线程或进程数。
+单个会话把核数用于媒体解密和转码，最多 16 路。一次导出多个会话时，同时读取的会话不超过 4 个，
+每个会话再分到剩余的媒体线程。媒体处理大部分时间在等 ffmpeg，所以用线程。
 HEVC 视频转成 H.264、wxgf 图片转成 JPEG 的结果缓存在 `~/Library/Application Support/WeChatExport/media_cache/`，
 再次导出同一会话时直接复用；占用空间过大时可以整个删掉。
 
@@ -57,7 +60,8 @@ HEVC 视频转成 H.264、wxgf 图片转成 JPEG 的结果缓存在 `~/Library/A
 - V2 图片密钥由 `Documents/app_data/**/kvcomm/key_<code>_*.statistic` 里的 code 和 wxid 推导：
   `md5(code + wxid)` 前 16 位十六进制字符为 AES 密钥，`code & 0xFF` 为尾段 XOR 密钥。导出时自动推导并写入
   `config.json`，也可以点“采集图片密钥”。推导结果会先用本地图片验证。
-- 部分图片是微信的 `wxgf`（HEVC）格式，需要 `ffmpeg` 转成 JPEG：`brew install ffmpeg`。
+- 部分图片是微信的 `wxgf`（HEVC）格式，语音 SILK 和 HEVC 视频也需要 ffmpeg。
+  密钥页“一键设置依赖”会安装它。从 Finder 启动时，还会查找 `/opt/homebrew/bin`、`/usr/local/bin` 和 `/opt/local/bin`。
 - 本地表情缓存用的是另一把未公开的密钥。导出时按消息里的 `cdnurl` / `encrypturl` 从微信 CDN
   下载表情，缓存到 `~/Library/Application Support/WeChatExport/emoji_cache/`。只请求 `*.qq.com`、
   `*.qpic.cn` 地址。不想联网时设置 `WECHAT_EXPORT_OFFLINE=1`，表情只显示 `[表情]`。

@@ -8,13 +8,19 @@ import io
 import os
 import sqlite3
 import subprocess
+import sys
 import tkinter as tk
 import wave
 from pathlib import Path
 
 import pytest
 
-from app import EXPORT_COLORS, WeChatExportApp
+from app import (
+    EXPORT_COLORS,
+    WeChatExportApp,
+    dependency_report,
+    install_missing_dependencies,
+)
 from cccryptor_probe import (
     PROBE_SPEC,
     KeyRecord,
@@ -33,11 +39,15 @@ from read_wechat_conversation import (
     MessageRecord,
     WeChatReader,
     build_memory_model,
+    current_wechat_account_key,
     decode_message_content,
     detect_sqlcipher_key_mode,
+    discover_message_databases,
     export_html,
+    export_model,
     export_sqlite,
     export_text,
+    plan_export_concurrency,
     parse_message_row,
     find_sqlcipher_driver,
     local_media_files,
@@ -323,6 +333,49 @@ def test_display_name_appends_remark() -> None:
     ) == "项目群（工作）"
 
 
+# 在一个账号目录里放一张只含一条文本的明文消息表。
+def _write_account_message(account_dir: Path, conversation_id: str, server_id: str, sent_at: int, text: str) -> None:
+    message_dir = account_dir / "db_storage" / "message"
+    message_dir.mkdir(parents=True)
+    table = "Msg_" + hashlib.md5(conversation_id.encode()).hexdigest()
+    connection = sqlite3.connect(message_dir / "message_0.db")
+    connection.execute(
+        f'CREATE TABLE "{table}" (local_id INTEGER, server_id TEXT, create_time INTEGER, local_type INTEGER, message_content BLOB, real_sender_id INTEGER)'
+    )
+    connection.execute(
+        f'INSERT INTO "{table}" VALUES (1, ?, ?, 1, ?, 1)',
+        (server_id, sent_at, text),
+    )
+    connection.commit()
+    connection.close()
+
+
+# 自动扫描多个微信号时，只读取最近登录的那个号，不把其他号的同群历史拼进来。
+def test_reader_keeps_current_account_messages(tmp_path: Path) -> None:
+    conversation_id = "44550358316@chatroom"
+    files = tmp_path / "xwechat_files"
+    current_dir = files / "wxid_current_aa11"
+    previous_dir = files / "wxid_previous_bb22"
+    _write_account_message(current_dir, conversation_id, "current-only", 1_720_000_000, "当前账号的消息")
+    _write_account_message(previous_dir, conversation_id, "previous-only", 1_700_000_000, "其他账号的旧消息")
+    home = tmp_path / "home"
+    login = home / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "xwechat_files" / "all_users" / "login"
+    (login / "wxid_current").mkdir(parents=True)
+    (login / "wxid_previous").mkdir(parents=True)
+    os.utime(login / "wxid_previous", (1_700_000_000, 1_700_000_000))
+    os.utime(login / "wxid_current", (1_720_000_000, 1_720_000_000))
+    assert current_wechat_account_key(home) == "wxid_current"
+    discovered = discover_message_databases(files, home)
+    assert [path.parent.parent.parent.name for path in discovered] == ["wxid_current_aa11"]
+    reader = WeChatReader(data_root=files, key_path=tmp_path / "keys.json", home=home)
+    model = reader.read_conversation(conversation_id, ["0" * 64], media_mode="serial")
+    contents = [item["content"] for item in model["messages"]]
+    assert contents == ["当前账号的消息"]
+    explicit = WeChatReader(data_root=previous_dir, key_path=tmp_path / "keys.json", home=home)
+    previous_model = explicit.read_conversation(conversation_id, ["0" * 64], media_mode="serial")
+    assert [item["content"] for item in previous_model["messages"]] == ["其他账号的旧消息"]
+
+
 # 验证没有联系人库时，会话列表仍能用 Name2Id 显示微信 ID、时间和最新消息。
 def test_conversation_list_resolves_name2id_preview(tmp_path: Path) -> None:
     conversation_id = "wxid_friend"
@@ -380,6 +433,104 @@ def test_memory_model_shape() -> None:
     assert model["messages"][0]["quote_sender"] == 2
 
 
+def test_plan_export_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
+    import read_wechat_conversation as conversation_reader
+
+    monkeypatch.setattr(conversation_reader.os, "cpu_count", lambda: 8)
+    assert plan_export_concurrency(1) == (1, 8)
+    assert plan_export_concurrency(3) == (3, 2)
+    assert plan_export_concurrency(10) == (4, 2)
+    monkeypatch.setattr(conversation_reader.os, "cpu_count", lambda: 1)
+    assert plan_export_concurrency(5) == (1, 1)
+    monkeypatch.setattr(conversation_reader.os, "cpu_count", lambda: None)
+    assert plan_export_concurrency(1) == (1, 1)
+
+
+def _tiny_png() -> bytes:
+    import struct
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    raw = b"\x00\xff\x00\x00"
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+# 验证 PDF 带上正文，TXT 仍走原来的纯文本导出。
+def test_export_pdf_and_txt(tmp_path: Path) -> None:
+    pytest.importorskip("fpdf")
+    reader, conversation_id, _voice_data = make_fixture(tmp_path)
+    model = reader.read_conversation(conversation_id, ["0" * 64])
+    model["media"].append(
+        {
+            "message_id": model["messages"][0]["local_id"],
+            "media_type": "image",
+            "mime_type": "image/png",
+            "filename": "pic.png",
+            "data": _tiny_png(),
+        }
+    )
+    pdf_path = export_model(model, "pdf", tmp_path / "pdf")
+    assert pdf_path.name == "chat.pdf"
+    assert pdf_path.read_bytes().startswith(b"%PDF")
+    text_path = export_model(model, "txt", tmp_path / "txt")
+    assert text_path.name == "chat.txt"
+    assert "文章标题" in text_path.read_text(encoding="utf-8")
+    extracted = subprocess.run(["pdftotext", str(pdf_path), "-"], capture_output=True, text=True)
+    if extracted.returncode == 0:
+        assert "文章标题" in extracted.stdout
+        assert "2023-11-15 06:13:20" in extracted.stdout
+
+
+def test_dependency_report_lists_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app as app_module
+
+    monkeypatch.setattr(app_module, "missing_python_packages", lambda: ["fpdf2"])
+    monkeypatch.setattr(app_module, "ffmpeg_available", lambda: False)
+    text, kind = dependency_report()
+    assert kind == "idle"
+    assert "fpdf2" in text
+    assert "ffmpeg" in text
+    monkeypatch.setattr(app_module, "missing_python_packages", lambda: [])
+    monkeypatch.setattr(app_module, "ffmpeg_available", lambda: True)
+    ready_text, ready_kind = dependency_report()
+    assert ready_kind == "ok"
+    assert ready_text == "依赖已就绪"
+
+
+def test_install_dependencies_invokes_pip_and_brew(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app as app_module
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(app_module, "missing_python_packages", lambda: ["fpdf2"])
+    monkeypatch.setattr(app_module, "ffmpeg_available", lambda: False)
+    monkeypatch.setattr(app_module, "_find_brew", lambda: "/opt/homebrew/bin/brew")
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(cmd))
+        if "fpdf2" in cmd:
+            monkeypatch.setattr(app_module, "missing_python_packages", lambda: [])
+        if cmd[-2:] == ["install", "ffmpeg"]:
+            monkeypatch.setattr(app_module, "ffmpeg_available", lambda: True)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+    ok, detail = install_missing_dependencies()
+    assert ok, detail
+    assert calls[0][0] == sys.executable
+    assert "fpdf2" in calls[0]
+    assert calls[1] == ["/opt/homebrew/bin/brew", "install", "ffmpeg"]
+
+    monkeypatch.setattr(app_module, "missing_python_packages", lambda: [])
+    monkeypatch.setattr(app_module, "ffmpeg_available", lambda: False)
+    monkeypatch.setattr(app_module, "_find_brew", lambda: None)
+    failed, message = install_missing_dependencies()
+    assert not failed
+    assert "Homebrew" in message
+
+
 # 验证 HTML、纯文本和 SQLite 三种导出及 SQLite 外键完整性。
 def test_all_exporters_and_media(tmp_path: Path) -> None:
     reader, conversation_id, voice_data = make_fixture(tmp_path)
@@ -413,8 +564,13 @@ def test_gui_buttons_create_and_restore() -> None:
     except tk.TclError as exc:
         pytest.skip(f"当前环境没有图形显示：{exc}")
     try:
-        assert list(app.export_buttons) == ["html", "text", "sqlite"]
-        assert [button.normal_background for button in app.export_buttons.values()] == [EXPORT_COLORS[key][0] for key in ("html", "text", "sqlite")]
+        assert list(app.export_buttons) == ["html", "txt", "pdf", "sqlite"]
+        assert [button.normal_background for button in app.export_buttons.values()] == [
+            EXPORT_COLORS[key][0] for key in ("html", "txt", "pdf", "sqlite")
+        ]
+        assert app.dependency_button.cget("text") == "一键设置依赖"
+        assert not hasattr(app, "media_mode_var")
+        assert "核" in app.concurrency_var.get()
         for key, button in app.export_buttons.items():
             original = button.normal_background
             button.set_enabled(False)
