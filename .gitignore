@@ -32,6 +32,7 @@ MANIFEST
 *.manifest
 *.spec
 !wxwatch.spec
+!packaging/macos.spec
 
 # Installer logs
 pip-log.txt
@@ -218,6 +219,8 @@ output/
 dist-linux/
 dist-win/
 .build/
+packaging/build/
+packaging/dist/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

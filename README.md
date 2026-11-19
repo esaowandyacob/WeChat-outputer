@@ -41,6 +41,19 @@ python -m pytest -q
 
 不要在 macOS 上运行 `python main.py` 或 `./run_gui.sh`。前者会退出并告诉你改跑 `python app.py`，后者是 Linux 界面。
 
+不想装 Python 时，用打包好的 `WeChatExport.app`。构建命令：
+
+```bash
+python3 -m venv .build/mac
+source .build/mac/bin/activate
+python -m pip install -r requirements-macos.txt pyinstaller
+pyinstaller --noconfirm --distpath packaging/dist --workpath packaging/build packaging/macos.spec
+```
+
+产物是 `packaging/dist/WeChatExport.app`，旁边可以放 `packaging/使用说明-mac.txt`。第一次打开需要在 Finder 里按住 Control 再点「打开」。完全磁盘访问权限要授给这个 App，不是终端。采集密钥仍然要关闭 SIP。
+
+Windows 安装包还没有。`wxwatch.spec` 只能在 Windows 上打出 exe。
+
 装不上依赖时：
 
 - `python3` 若是 python.org 安装的 3.10，pip 可能报 `CERTIFICATE_VERIFY_FAILED`。双击 `/Applications/Python 3.10/Install Certificates.command`。仍然失败就改用 Python 3.12 或 3.13。

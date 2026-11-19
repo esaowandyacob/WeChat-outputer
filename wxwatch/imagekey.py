@@ -18,11 +18,23 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
-CONFIG_FILE = PROJECT / "config.json"
+
+
+def config_path() -> Path:
+    """图片密钥文件。源码运行放在项目目录；macOS 安装包放在用户库，避免写进只读的 .app。"""
+    if getattr(sys, "frozen", False) and sys.platform == "darwin":
+        directory = Path.home() / "Library" / "Application Support" / "WeChatExport"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "config.json"
+    return PROJECT / "config.json"
+
+
+CONFIG_FILE = config_path()
 
 
 def _chown_user(path: Path):
@@ -474,7 +486,10 @@ def _macos_image_pids(preferred: int) -> list[int]:
 
 
 def _image_key_scanner() -> Path:
-    source = Path(__file__).resolve().parent / "scan_imgkey_mac.c"
+    if getattr(sys, "frozen", False):
+        source = Path(getattr(sys, "_MEIPASS")) / "wxwatch" / "scan_imgkey_mac.c"
+    else:
+        source = Path(__file__).resolve().parent / "scan_imgkey_mac.c"
     binary = Path(tempfile.gettempdir()) / "scan_imgkey_mac"
     if binary.exists() and binary.stat().st_mtime >= source.stat().st_mtime:
         return binary

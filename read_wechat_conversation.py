@@ -1957,7 +1957,9 @@ def _decode_wechat_dat(path: Path) -> bytes | None:
         from wxwatch.imagedat import decode_dat, load_image_keys
     except Exception:
         return None
-    config_path = Path(__file__).resolve().parent / "config.json"
+    from wxwatch.imagekey import CONFIG_FILE
+
+    config_path = CONFIG_FILE
     image_key, xor_key = load_image_keys(config_path)
     try:
         decoded = decode_dat(path, image_key, xor_key)

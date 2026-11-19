@@ -40,7 +40,14 @@ from read_wechat_conversation import (
 )
 
 
-ASSET_DIR = Path(__file__).resolve().parent / "assets"
+def _resource_root() -> Path:
+    """源码运行用项目目录。打包后图标在 PyInstaller 的资源目录里。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent
+
+
+ASSET_DIR = _resource_root() / "assets"
 UI_FONT = "Microsoft YaHei UI" if sys.platform == "win32" else "PingFang SC"
 
 # 石灰岩底、暖白卡片、一种墨色。状态靠图标形状，不靠额外颜色。
@@ -75,7 +82,9 @@ PYTHON_DEPENDENCIES = (
 # 返回当前平台默认的导出目录。
 def _image_key_status() -> tuple[str, str]:
     """图片密钥文案和状态图标：ok 已保存，idle 尚未采集。"""
-    config_path = Path(__file__).resolve().parent / "config.json"
+    from wxwatch.imagekey import CONFIG_FILE
+
+    config_path = CONFIG_FILE
     if not config_path.is_file():
         return "尚未采集图片密钥", "idle"
     try:
@@ -224,6 +233,8 @@ def install_missing_dependencies(progress: Callable[[str], None] | None = None) 
             progress(text)
 
     packages = missing_python_packages()
+    if packages and getattr(sys, "frozen", False):
+        return False, "安装包里缺少 " + "、".join(packages) + "。请重新下载安装包。"
     if packages:
         say("正在安装 " + "、".join(packages) + "…")
         completed = subprocess.run(
