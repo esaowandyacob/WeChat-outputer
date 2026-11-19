@@ -1,9 +1,12 @@
+# 可选。小白在 macOS 上用 README 里的 venv 即可，不必走 conda。
+# 这个文件只装测试依赖。Linux / Windows 界面还要再执行:
+#   python -m pip install -r requirements.txt
 name: wechat_sqlite
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.14
+  - python=3.13
   - pip
   - pip:
       - -r requirements-dev.txt

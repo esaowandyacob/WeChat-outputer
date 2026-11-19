@@ -1,6 +1,5 @@
-# 运行时依赖。需要 64 位 Python 3.10+。
-# macOS 界面使用标准库 Tkinter。
-# Linux / Windows（main.py）使用 SQLCipher、watchdog 和 PySide6。
+# Linux / Windows 运行时依赖（python main.py）。需要 64 位 Python 3.11+。
+# macOS 只跑导出界面时安装 requirements-macos.txt，不必装下面的 PySide6。
 # sqlcipher3 自带 Windows / macOS / Linux 预编译 wheel。
 
 zstandard>=0.23.0

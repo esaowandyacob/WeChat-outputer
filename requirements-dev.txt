@@ -1,3 +1,5 @@
-# 开发 / 测试依赖。
--r requirements.txt
+# 开发 / 测试依赖。不含 PySide6。
+# Linux / Windows 图形界面另装 requirements.txt。
+-r requirements-macos.txt
+watchdog>=4.0
 pytest>=8.0

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# wxwatch GUI 启动脚本（自动提权，全程免应用内密码）
-# 解决 PySide6 自带 Qt 与系统 Qt 库冲突（libQt6DBus 符号错误）
+# Linux 上的 PySide6 界面。自动提权，并避开系统 Qt 与 PySide6 的库冲突。
+# macOS 导出界面是 python app.py，不要跑这个脚本。
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "macOS 请在项目目录运行: python app.py"
+  echo "run_gui.sh 只启动 Linux 上的界面。"
+  exit 1
+fi
 cd "$(dirname "$(readlink -f "$0")")"
 QT_LIB=$(dirname "$(find .venv -name 'libQt6Core.so.6' | head -1)")
 export LD_LIBRARY_PATH="$QT_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

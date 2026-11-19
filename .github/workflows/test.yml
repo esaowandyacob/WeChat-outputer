@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -r requirements-dev.txt
+      - name: Test
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then
+            # 这个文件在导入时需要 Tk。Linux 的 GUI 测试留在本机。
+            python -m pytest -q --ignore=tests/test_wechat_export.py
+          else
+            python -m pytest -q
+          fi

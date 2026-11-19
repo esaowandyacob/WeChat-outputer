@@ -2,23 +2,65 @@
 
 本机工具，面向微信 4.x。不上传聊天记录、数据库或密钥。
 
+仓库：<https://github.com/esaowandyacob/WeChat-outputer>
+
 | 系统 | 入口 | 能力 |
 | --- | --- | --- |
-| macOS | `python app.py` | DTrace 采集密钥，导出 HTML / 纯文本 / SQLite |
+| macOS | `python app.py` | DTrace 采集密钥，导出 HTML / 纯文本 / PDF / SQLite |
 | Linux、Windows | `python main.py` | 从进程内存提取 SQLCipher 密钥，解析、监听、图形界面 |
 
 不支持旧版 Windows 微信 3.x（`WeChat Files/<wxid>/Msg`）。
 
+## 小白：macOS 从零跑起来
+
+需要 64 位 Python 3.11 或更新。先看版本：
+
+```bash
+python3 --version
+```
+
+在项目目录里：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements-macos.txt
+python -c "import tkinter, zstandard, sqlcipher3, Crypto, fpdf; print('依赖已就绪')"
+python app.py
+```
+
+最后一行会打开标题为「微信聊天记录导出」的窗口。看到窗口就说明程序能跑。微信还没登录、还没采到密钥时，窗口里会提示下一步，这是正常的。
+
+确认测试也通过：
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+不要在 macOS 上运行 `python main.py` 或 `./run_gui.sh`。前者会退出并告诉你改跑 `python app.py`，后者是 Linux 界面。
+
+装不上依赖时：
+
+- `python3` 若是 python.org 安装的 3.10，pip 可能报 `CERTIFICATE_VERIFY_FAILED`。双击 `/Applications/Python 3.10/Install Certificates.command`。仍然失败就改用 Python 3.12 或 3.13。
+- 不要用 `requirements.txt` 当 macOS 的第一步。那个文件会再装 PySide6，体积大约 1GB，macOS 界面用不到。
+- 窗口能开、但图片或视频是空的：密钥页点「一键设置依赖」，它会补 ffmpeg。只有文字导出时可以先不装。
+
 ## 安装
 
-需要 64 位 Python 3.10+。
+### macOS
+
+用上面的 `requirements-macos.txt`。
+
+### Linux、Windows
 
 ```bash
 python -m venv .venv
 ```
 
 ```bash
-# macOS / Linux
+# Linux
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
@@ -29,12 +71,7 @@ REM Windows
 python -m pip install -r requirements.txt
 ```
 
-已有 conda 环境时：
-
-```bash
-conda activate wechat_sqlite
-python -m pip install -r requirements.txt
-```
+`environment.yml` 是可选的 conda 测试环境，不是小白路径。Linux / Windows 界面仍要再装 `requirements.txt`。
 
 ## macOS
 
@@ -112,4 +149,6 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-测试使用临时数据库，不会读取真实微信数据。
+测试使用临时数据库，不会读取真实微信数据。2026-11-19 在一台新的 Python 3.13 虚拟环境里，只装 `requirements-dev.txt`（没有 PySide6），49 项测试通过，隐藏窗口能创建，依赖检查显示「依赖已就绪」（本机已有 ffmpeg）。
+
+参与改动见 [CONTRIBUTING.md](CONTRIBUTING.md)。不要把密钥和聊天记录提交上来，说明见 [SECURITY.md](SECURITY.md)。

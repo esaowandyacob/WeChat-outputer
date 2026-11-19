@@ -1,0 +1,8 @@
+# macOS 导出界面（python app.py）需要的包。界面本身用系统 Tkinter。
+# 不安装 PySide6 和 watchdog：前者只给 Linux / Windows 界面，大约 1GB。
+# 要跑测试再装 requirements-dev.txt。
+
+zstandard>=0.23.0
+sqlcipher3>=0.6.2
+pycryptodome>=3.20
+fpdf2>=2.7.9
