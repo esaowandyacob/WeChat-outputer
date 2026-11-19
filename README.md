@@ -118,8 +118,9 @@ HEVC 视频转成 H.264、wxgf 图片转成 JPEG 的结果缓存在 `~/Library/A
 
 ## Linux / Windows
 
-密钥按各库文件头 salt 在进程内存里匹配，并用 page-1 HMAC 校验。Linux 读
-`/proc/<pid>/mem`，Windows 对 `Weixin.exe` 调用 `ReadProcessMemory`。
+已登录进程里的数据库密钥被一段固定异或掩码盖住。扫描时解开掩码，再按各库
+文件头 salt 做 page-1 HMAC 校验。Linux 读 `/proc/<pid>/mem`，Windows 对
+`Weixin.exe` 调用 `ReadProcessMemory`。
 
 ```bash
 # Linux：提取密钥需要 root

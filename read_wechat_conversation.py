@@ -568,9 +568,11 @@ def default_wechat_data_roots(home: Path | None = None) -> list[Path]:
     roots: list[Path] = []
     if env_root:
         roots.append(Path(env_root).expanduser())
+    from wxwatch.dataroot import xwechat_file_roots
+
+    roots.extend(xwechat_file_roots(home))
     roots.extend(
         [
-            home_path / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "xwechat_files",
             home_path
             / "Library"
             / "Containers"
@@ -582,7 +584,18 @@ def default_wechat_data_roots(home: Path | None = None) -> list[Path]:
             home_path / "Library" / "Application Support" / "com.tencent.xinWeChat",
         ]
     )
-    return roots
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            key = str(root.expanduser().resolve()).casefold()
+        except OSError:
+            key = str(root).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
 
 
 # 在一组根目录中扫描严格命名为 message_N.db 的消息分片。
@@ -641,40 +654,9 @@ def account_key_from_path(path: Path | str) -> str | None:
 
 # 最近一次登录的微信号。Mac 微信同一时间只登录一个号，其余号的库仍留在磁盘上。
 def current_wechat_account_key(home: Path | None = None) -> str | None:
-    home_path = home if home is not None else Path.home()
-    documents = (
-        home_path
-        / "Library"
-        / "Containers"
-        / "com.tencent.xinWeChat"
-        / "Data"
-        / "Documents"
-    )
-    login_dirs = (
-        documents / "xwechat_files" / "all_users" / "login",
-        documents / "app_data" / "login",
-    )
-    best_key: str | None = None
-    best_mtime = -1.0
-    for directory in login_dirs:
-        if not directory.is_dir():
-            continue
-        try:
-            children = list(directory.iterdir())
-        except OSError:
-            continue
-        for child in children:
-            key = account_key_from_name(child.name)
-            if key is None or not child.is_dir():
-                continue
-            try:
-                mtime = child.stat().st_mtime
-            except OSError:
-                continue
-            if mtime > best_mtime:
-                best_mtime = mtime
-                best_key = key
-    return best_key
+    from wxwatch.dataroot import current_account_key
+
+    return current_account_key(home)
 
 
 # 同一台 Mac 上每个登录过的号都有一份同群消息。自动扫描时只留当前账号。
@@ -718,7 +700,26 @@ def discover_message_databases(data_root: Path | str | None = None, home: Path |
     else:
         selected_root = None
         roots = default_wechat_data_roots(home)
-    discovered = limit_to_current_account(_scan_message_databases(roots), selected_root, home)
+    discovered = _scan_message_databases(roots)
+    if selected_root is None:
+        from wxwatch.dataroot import configured_xwechat_root
+
+        configured = configured_xwechat_root(home)
+        if configured is not None:
+            try:
+                configured_resolved = configured.resolve()
+            except OSError:
+                configured_resolved = configured
+            preferred = []
+            for item in discovered:
+                try:
+                    item.resolve().relative_to(configured_resolved)
+                except (OSError, ValueError):
+                    continue
+                preferred.append(item)
+            if preferred:
+                discovered = preferred
+    discovered = limit_to_current_account(discovered, selected_root, home)
     return sorted(
         discovered,
         key=lambda item: (str(item.parent), int(MESSAGE_FILE_RE.fullmatch(item.name).group(1) or 0)),

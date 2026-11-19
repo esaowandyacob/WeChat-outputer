@@ -26,19 +26,14 @@ DECRYPTED_DIR = PROJECT / "decrypted"
 
 
 def find_db_storage() -> Path:
-    if sys.platform == "win32":
-        home = Path.home()
-    else:
-        import pwd
+    from wxwatch.dataroot import locate_db_storage
 
-        user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
-        home = Path(pwd.getpwnam(user).pw_dir) if user else Path.home()
-    root = home / "Documents" / "xwechat_files"
-    candidates = sorted(root.glob("wxid_*_*/db_storage")) + \
-        sorted(p for p in root.glob("*/db_storage") if p.parent.name.startswith("wxid_"))
-    if not candidates:
-        sys.exit(f"[ERR] 未在 {root} 下找到 wxid_*/db_storage，请确认微信已登录过")
-    return candidates[0]
+    found = locate_db_storage()
+    if found is None:
+        sys.exit("[ERR] 未找到微信 4.x 的 db_storage。"
+                 "已检查微信配置的保存目录、文档目录、用户目录和 macOS 容器目录。"
+                 "请确认微信已登录，或用 --db-storage 指定。")
+    return found
 
 
 def _keyscan_module():
@@ -228,7 +223,7 @@ def cmd_status(_args):
         n = len(list(ds.rglob("*.db")))
         print(f"  {ds}（{n} 个 .db）")
     except SystemExit:
-        print("  未找到 ~/Documents/xwechat_files/wxid_*/db_storage")
+        print("  未找到微信 4.x 的 db_storage")
         return
     print("[密钥]")
     if not KEYS_FILE.exists():

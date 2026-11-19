@@ -39,18 +39,11 @@ class Backend:
             raise RuntimeError("缺少 keys.json，请先运行: sudo .venv/bin/python main.py extract-keys")
         keys = json.loads(KEYS_FILE.read_text())
         if db_storage is None:
-            import os
-            if sys.platform == "win32":
-                home = Path.home()
-            else:
-                import pwd
-                user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
-                home = Path(pwd.getpwnam(user).pw_dir) if user else Path.home()
-            root = home / "Documents" / "xwechat_files"
-            cands = sorted(p for p in root.glob("*/db_storage") if p.parent.name.startswith("wxid_"))
-            if not cands:
-                raise RuntimeError(f"未在 {root} 找到微信数据目录")
-            db_storage = cands[0]
+            from wxwatch.dataroot import locate_db_storage
+
+            db_storage = locate_db_storage()
+            if db_storage is None:
+                raise RuntimeError("未找到微信 4.x 数据目录 db_storage")
         self.db_storage = db_storage
         self.dec = Decryptor(db_storage, keys, MIRROR_DIR)
         self.parser = Parser(self.dec, db_storage.parent)

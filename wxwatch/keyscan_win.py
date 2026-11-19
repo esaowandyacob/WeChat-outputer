@@ -1,6 +1,6 @@
 """Windows 版密钥提取：枚举 Weixin.exe 进程并用 ReadProcessMemory 扫描内存。
 
-与 Linux 版（wxwatch/keyscan.py）共用密钥正则、salt 收集与 page-1 HMAC 校验，
+与 Linux 版（wxwatch/keyscan.py）共用异或掩码解码、salt 收集与 page-1 HMAC 校验，
 仅进程枚举与内存读取走 Win32 API。ctypes.windll 只在本模块的函数内访问，
 因此在 Linux 上 import 本模块不会报错，仅真正调用时会得到清晰的平台错误。
 
@@ -15,8 +15,8 @@ import sys
 from ctypes import wintypes
 from pathlib import Path
 
-from wxwatch.keyscan import (_scan_chunk, collect_db_salts, match_keys_to_dbs,
-                             write_keys_file)
+from wxwatch.keyscan import (_CHUNK_OVERLAP, _scan_chunk, collect_db_salts,
+                             match_keys_to_dbs, write_keys_file)
 
 # ---- Win32 常量 ----
 TH32CS_SNAPPROCESS = 0x00000002
@@ -24,6 +24,8 @@ PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
 MEM_COMMIT = 0x1000
 MEM_PRIVATE = 0x20000
+# 页文件支撑的匿名映射。被异或掩码盖住的 cipher 记录在 MEM_PRIVATE 或这里。
+MEM_MAPPED = 0x40000
 PAGE_GUARD = 0x100
 # 所有"含读权限"的页保护属性
 _READABLE_PROTECTS = frozenset({
@@ -166,8 +168,9 @@ class _ProcessMemory:
     def regions(self) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
         """VirtualQueryEx 枚举内存区域，返回 (可写区域, 其他可读区域)。
 
-        只保留 MEM_PRIVATE 且已提交（MEM_COMMIT）、含读权限、非 PAGE_GUARD 的区域；
-        单块超 2GB 跳过。可写区域（堆）是第一梯队，与 Linux 版的分层策略一致。
+        保留已提交、含读权限、非 PAGE_GUARD 的 MEM_PRIVATE 与 MEM_MAPPED。
+        不读 MEM_IMAGE（DLL 映像里没有 cipher 记录）。单块超 2GB 跳过。
+        可写区域是第一梯队，与 Linux 版的分层策略一致。
         """
         rw: list[tuple[int, int]] = []
         other: list[tuple[int, int]] = []
@@ -180,7 +183,7 @@ class _ProcessMemory:
                 break  # 到达地址空间顶部
             base, size = int(mbi.BaseAddress), int(mbi.RegionSize)
             protect = mbi.Protect
-            if (mbi.State == MEM_COMMIT and mbi.Type == MEM_PRIVATE
+            if (mbi.State == MEM_COMMIT and mbi.Type in (MEM_PRIVATE, MEM_MAPPED)
                     and protect in _READABLE_PROTECTS and not protect & PAGE_GUARD
                     and 0 < size <= _MAX_REGION):
                 (rw if protect in _RW_PROTECTS else other).append((base, size))
@@ -198,17 +201,21 @@ class _ProcessMemory:
         return buf.raw[: read.value] if ok else b""
 
     def scan(self, regions: list[tuple[int, int]]) -> dict[bytes, bytes]:
-        """扫描给定区域列表，返回 {salt: key} 候选（匹配复用 keyscan._scan_chunk）。"""
+        """扫描给定区域列表，返回 {salt: key}。
+
+        不含 salt 的 64 位密钥留在 self.unbound，供调用方对每个库做 HMAC。
+        """
         found: dict[bytes, bytes] = {}
+        self.unbound: set[bytes] = set()
         for base, size in regions:
             pos = 0
             while pos < size:
                 data = self.read_chunk(base + pos, min(_CHUNK, size - pos))
                 if not data:
                     break  # 区域被释放或部分页不可读，跳过剩余部分
-                _scan_chunk(data, found)
-                # 重叠 100 字节防止跨块边界漏匹配（密钥串 99 字节，与 Linux 版一致）
-                pos += max(1, len(data) - 100)
+                _scan_chunk(data, found, self.unbound)
+                # 重叠一整条掩码记录，避免 x'<hex>' 被切在两次读取的边界上
+                pos += max(1, len(data) - _CHUNK_OVERLAP)
         return found
 
 
@@ -223,6 +230,7 @@ def extract_keys_win(db_storage: Path, out_file: Path) -> dict:
     print(f"[*] 在 {db_storage} 下发现 {len(db_salts)} 个加密数据库")
 
     candidates: dict[bytes, bytes] = {}
+    unbound: set[bytes] = set()
     for pid in pids:
         try:
             mem = _ProcessMemory(pid)
@@ -233,20 +241,22 @@ def extract_keys_win(db_storage: Path, out_file: Path) -> dict:
         with mem:
             rw, other = mem.regions()
             found = mem.scan(rw)
-            print(f"[*] 可写区域扫描得到 {len(found)} 个候选密钥")
-            if not found:
+            unbound.update(mem.unbound)
+            print(f"[*] 可写区域扫描得到 {len(found) + len(mem.unbound)} 个候选密钥")
+            if not found and not mem.unbound:
                 print("[*] 未找到，扩大范围扫描其余可读区域（较慢）...")
                 found = mem.scan(other)
-                print(f"[*] 全量扫描得到 {len(found)} 个候选密钥")
+                unbound.update(mem.unbound)
+                print(f"[*] 全量扫描得到 {len(found) + len(mem.unbound)} 个候选密钥")
         for salt, key in found.items():
             candidates.setdefault(salt, key)
         if db_salts and all(s in candidates for s in db_salts):
             break  # 已覆盖全部本地库，不必再扫其他微信子进程
 
-    if not candidates:
-        raise RuntimeError("内存中未找到密钥字符串。微信是否已登录？")
+    if not candidates and not unbound:
+        raise RuntimeError("内存中未找到异或掩码下的密钥记录。微信是否已登录？")
 
-    keys = match_keys_to_dbs(candidates, db_salts, db_storage)
+    keys = match_keys_to_dbs(candidates, db_salts, db_storage, unbound)
     write_keys_file(keys, out_file)
     return keys
 

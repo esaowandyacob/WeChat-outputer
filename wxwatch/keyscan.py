@@ -1,8 +1,8 @@
 """从运行中的微信进程内存提取 SQLCipher 4 密钥。
 
-原理：WCDB 会在进程内存里缓存 `x'<64hex enc_key><32hex salt>'` 形式的
-密钥字符串。扫描 /proc/<pid>/mem，按 salt（各加密 db 文件头 16 字节）
-归类候选，再用 sqlcipher3 实际打开验证。
+已登录进程里不保留明文 ``x'...'``。WCDB 的 cipher 记录被一段固定 32 字节
+异或掩码盖住，相位相对每条记录自己的起点。扫描时按全部相位解开，带 salt
+的候选按 salt 归类，其余候选再对每个库做 page-1 HMAC 校验。
 
 需要 root（ptrace_scope=1 时读 /proc/pid/mem 必须有 CAP_SYS_PTRACE）。
 用法：sudo .venv/bin/python main.py extract-keys
@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import sys
 from pathlib import Path
 
-KEY_PATTERN = re.compile(rb"x'([0-9a-fA-F]{64})([0-9a-fA-F]{32})'")
+# 固定异或掩码。微信把 ``x'<64hex key>[32hex salt]'`` 按这条记录自己的下标
+# 与掩码逐字节异或后放在进程内存里；掩码长度就是周期，不跟虚拟地址对齐。
+CIPHER_XOR_MASK = bytes.fromhex(
+    "d2c7442458020000004889442450488b450048844c2448488944254048584c24"
+)
+# x' + 最多 192 个 hex + 结束引号。跨块重叠必须盖住一整条记录。
+_MAX_RECORD = 2 + 192 + 1
+_CHUNK_OVERLAP = _MAX_RECORD - 1
 # 单次读取的内存块上限，避免一次性吃掉过多内存
 _CHUNK = 64 * 1024 * 1024
 
@@ -76,20 +82,100 @@ def _iter_memory_regions(pid: int):
     return rw_anon, other_anon
 
 
-def _scan_chunk(data: bytes, found: dict[bytes, bytes]) -> None:
-    """在单块内存数据中匹配密钥字符串，累积到 found（同一 salt 先到先赢）。
+def mask_cipher_blob(plain: bytes, phase: int = 0) -> bytes:
+    """用固定掩码盖住一段 cipher 记录。phase 是这条记录自己的起点相位。"""
+    size = len(CIPHER_XOR_MASK)
+    phase %= size
+    return bytes(byte ^ CIPHER_XOR_MASK[(phase + index) % size] for index, byte in enumerate(plain))
 
-    Windows 版（keyscan_win）复用本函数，保证两端匹配行为完全一致。
+
+def _is_hex_byte(value: int) -> bool:
+    return (0x30 <= value <= 0x39) or (0x61 <= value <= 0x66) or (0x41 <= value <= 0x46)
+
+
+def _accept_key(found: dict[bytes, bytes], unbound: set[bytes] | None,
+                key: bytes, salt: bytes | None) -> None:
+    """带 salt 的记录先按 salt 归类；对不上或没有 salt 的留给 HMAC。"""
+    if salt is not None:
+        previous = found.get(salt)
+        if previous is None:
+            found[salt] = key
+            return
+        if previous == key or unbound is None:
+            return
+        unbound.add(key)
+        return
+    if unbound is not None:
+        unbound.add(key)
+
+
+def _accept_decoded(decoded: bytes, found: dict[bytes, bytes],
+                    unbound: set[bytes] | None) -> None:
+    """从解开后的 ``x'<hex>'`` 里取出 32 字节密钥和可选的 16 字节 salt。"""
+    if len(decoded) < 67 or decoded[0] not in (0x78, 0x58) or decoded[1] != 0x27 or decoded[-1] != 0x27:
+        return
+    run = decoded[2:-1]
+    if len(run) < 64 or len(run) > 192 or any(not _is_hex_byte(byte) for byte in run):
+        return
+    starts = [0]
+    if len(run) > 96:
+        starts.extend(range(0, len(run) - 63, 32))
+        tail = len(run) - 64
+        if tail not in starts:
+            starts.append(tail)
+    for start in starts:
+        if start + 64 > len(run):
+            continue
+        try:
+            key = bytes.fromhex(run[start:start + 64].decode("ascii"))
+        except ValueError:
+            continue
+        salt = None
+        if len(run) >= start + 96:
+            try:
+                salt = bytes.fromhex(run[start + 64:start + 96].decode("ascii"))
+            except ValueError:
+                salt = None
+        _accept_key(found, unbound, key, salt)
+
+
+def _scan_chunk(data: bytes, found: dict[bytes, bytes],
+                unbound: set[bytes] | None = None) -> None:
+    """在单块内存里找被固定异或掩码盖住的 cipher 记录。
+
+    不搜索明文 ``x'...'``。掩码相位是每条记录自己的，32 种对齐都要试。
+    Windows 版复用本函数，保证两端匹配行为一致。
     """
-    for m in KEY_PATTERN.finditer(data):
-        key = bytes.fromhex(m.group(1).decode())
-        salt = bytes.fromhex(m.group(2).decode())
-        found.setdefault(salt, key)
+    mask = CIPHER_XOR_MASK
+    size = len(mask)
+    limit = len(data)
+    for phase in range(size):
+        prefix = bytes((0x78 ^ mask[phase], 0x27 ^ mask[(phase + 1) % size]))
+        start = 0
+        while True:
+            index = data.find(prefix, start)
+            if index < 0:
+                break
+            start = index + 1
+            decoded = bytearray()
+            max_len = min(_MAX_RECORD, limit - index)
+            for length in range(max_len):
+                value = data[index + length] ^ mask[(phase + length) % size]
+                decoded.append(value)
+                if length < 2:
+                    continue
+                if value == 0x27:
+                    if length >= 66:
+                        _accept_decoded(bytes(decoded), found, unbound)
+                    break
+                if not _is_hex_byte(value):
+                    break
 
 
-def _scan_regions(pid: int, regions) -> dict[bytes, bytes]:
-    """扫描指定内存区域，返回 {salt_bytes: key_bytes} 候选。"""
+def _scan_regions(pid: int, regions) -> tuple[dict[bytes, bytes], set[bytes]]:
+    """扫描指定内存区域，返回 ({salt: key}，不含 salt 的密钥集合)。"""
     found: dict[bytes, bytes] = {}
+    unbound: set[bytes] = set()
     mem = os.open(f"/proc/{pid}/mem", os.O_RDONLY)
     try:
         for start, end in regions:
@@ -103,12 +189,12 @@ def _scan_regions(pid: int, regions) -> dict[bytes, bytes]:
                     break  # 区域不可读（可能已 unmap），跳过
                 if not data:
                     break
-                _scan_chunk(data, found)
-                # 重叠 100 字节防止跨块边界漏匹配
-                pos += max(1, len(data) - 100)
+                _scan_chunk(data, found, unbound)
+                # 重叠一整条记录，避免密钥被切在两块内存的边界上
+                pos += max(1, len(data) - _CHUNK_OVERLAP)
     finally:
         os.close(mem)
-    return found
+    return found, unbound
 
 
 def collect_db_salts(db_storage: Path) -> dict[bytes, Path]:
@@ -153,9 +239,10 @@ def verify_key(db_path: Path, key: bytes) -> bool:
 
 
 def match_keys_to_dbs(candidates: dict[bytes, bytes], db_salts: dict[bytes, Path],
-                      db_storage: Path) -> dict:
-    """把内存候选按 salt 匹配到本地库并逐一 HMAC 验证，返回 keys 字典。
+                      db_storage: Path, unbound: set[bytes] | None = None) -> dict:
+    """把内存候选匹配到本地库并逐一 HMAC 验证，返回 keys 字典。
 
+    旧格式候选已带 salt。新格式只有密钥，要对每个尚未配对的库试 HMAC。
     rel 路径统一用 POSIX 分隔符，保证 Windows 产出的 keys.json 与 Linux 格式一致
     （Linux 上 as_posix() 与 str() 等价，行为不变）。
     """
@@ -172,8 +259,26 @@ def match_keys_to_dbs(candidates: dict[bytes, bytes], db_salts: dict[bytes, Path
             print(f"  [OK] {rel}")
         else:
             print(f"  [FAIL] {rel} salt 匹配但验证失败")
-    if unmatched:
-        print(f"[*] {len(unmatched)} 个候选未匹配到本地数据库（可能属于其他库）")
+    unbound_left = 0
+    for key in unbound or ():
+        hit = False
+        for salt, db_path in db_salts.items():
+            rel = db_path.relative_to(db_storage).as_posix()
+            if rel in keys:
+                continue
+            if not verify_key(db_path, key):
+                continue
+            keys[rel] = {"key": key.hex(), "salt": salt.hex()}
+            print(f"  [OK] {rel}")
+            hit = True
+        if not hit:
+            unbound_left += 1
+    if unmatched or unbound_left:
+        print(f"[*] {len(unmatched) + unbound_left} 个候选未匹配到本地数据库（可能属于其他库）")
+    missing = len(db_salts) - len(keys)
+    if missing:
+        print(f"[*] 还有 {missing} 个库没有通过 page-1 HMAC。"
+              "这些库的密钥不在当前进程的异或掩码记录里。")
     if not keys:
         raise RuntimeError("没有找到任何可用密钥。")
     return keys
@@ -205,17 +310,17 @@ def extract_keys(db_storage: Path, out_file: Path) -> dict:
     print(f"[*] 在 {db_storage} 下发现 {len(db_salts)} 个加密数据库")
 
     rw_anon, readable = _iter_memory_regions(pid)
-    candidates = _scan_regions(pid, rw_anon)
-    print(f"[*] 堆内存扫描得到 {len(candidates)} 个候选密钥")
-    if not candidates:
+    candidates, unbound = _scan_regions(pid, rw_anon)
+    print(f"[*] 堆内存扫描得到 {len(candidates) + len(unbound)} 个候选密钥")
+    if not candidates and not unbound:
         print("[*] 堆中未找到，扩大范围扫描全部可读区域（较慢）...")
-        candidates = _scan_regions(pid, readable)
-        print(f"[*] 全量扫描得到 {len(candidates)} 个候选密钥")
+        candidates, unbound = _scan_regions(pid, readable)
+        print(f"[*] 全量扫描得到 {len(candidates) + len(unbound)} 个候选密钥")
 
-    if not candidates:
-        raise RuntimeError("内存中未找到密钥字符串。微信是否已登录？")
+    if not candidates and not unbound:
+        raise RuntimeError("内存中未找到异或掩码下的密钥记录。微信是否已登录？")
 
-    keys = match_keys_to_dbs(candidates, db_salts, db_storage)
+    keys = match_keys_to_dbs(candidates, db_salts, db_storage, unbound)
     write_keys_file(keys, out_file)
     return keys
 

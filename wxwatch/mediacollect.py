@@ -179,8 +179,11 @@ def main(argv=None):
 
     project = Path(__file__).resolve().parent.parent
     keys = json.loads((project / "keys.json").read_text())
-    ds = args.db_storage or sorted(
-        Path.home().glob("Documents/xwechat_files/wxid_*/db_storage"))[0]
+    from wxwatch.dataroot import locate_db_storage
+
+    ds = args.db_storage or locate_db_storage()
+    if ds is None:
+        raise SystemExit("[ERR] 未找到微信 db_storage")
     dec = Decryptor(ds, keys, project / "mirror")
     parser = Parser(dec, ds.parent)
 

@@ -3,7 +3,6 @@
 import csv
 import html
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -22,19 +21,10 @@ from wxwatch.gui.widgets import make_button
 
 
 def detect_db_storage() -> Path | None:
-    """自动检测微信 db_storage 目录（sudo 运行时定位真实用户的 home）。"""
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user and sys.platform != "win32":
-        import pwd
-        try:
-            home = Path(pwd.getpwnam(sudo_user).pw_dir)
-        except KeyError:
-            home = Path.home()
-    else:
-        home = Path.home()
-    root = home / "Documents" / "xwechat_files"
-    cands = sorted(p for p in root.glob("*/db_storage") if p.parent.name.startswith("wxid_"))
-    return cands[0] if cands else None
+    """自动检测当前账号的 db_storage（macOS 容器目录与 Windows 配置目录都认）。"""
+    from wxwatch.dataroot import locate_db_storage
+
+    return locate_db_storage()
 
 
 def check_db_storage(path: str | Path) -> tuple[bool, str]:

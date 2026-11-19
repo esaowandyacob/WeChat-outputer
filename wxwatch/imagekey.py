@@ -566,7 +566,11 @@ def main():
     args = ap.parse_args()
     ds = args.db_storage
     if ds is None:
-        ds = sorted(Path.home().glob("Documents/xwechat_files/wxid_*/db_storage"))[0]
+        from wxwatch.dataroot import locate_db_storage
+
+        ds = locate_db_storage()
+        if ds is None:
+            raise SystemExit("[ERR] 未找到微信 db_storage")
     extract_image_key(ds)
 
 
