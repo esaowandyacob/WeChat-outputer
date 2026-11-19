@@ -93,6 +93,10 @@ run_gui.bat
 数据目录默认是 `~/Documents/xwechat_files/wxid_*/db_storage`。
 `keys.json`、`output/`、`mirror/`、`decrypted/` 在程序目录，里面是明文聊天，不要提交。
 
+实时预览仅维护内存游标，不读写命令行导出的进度文件。命令行每会话 JSONL 文件名固定为
+`会话名__会话ID的完整MD5.jsonl`，避免同名会话在重启后混写。旧版本生成的文件原样保留，
+后续增量消息写入新命名文件；不会自动合并或修复旧文件中已经混入的消息。
+
 Windows 上若 `sqlcipher3` 轮子不可用，打包时改用 SQLCipher 版 `sqlite3.dll`，
 `wxwatch.decryptor` 会回退到标准库 `sqlite3`。单文件构建：
 

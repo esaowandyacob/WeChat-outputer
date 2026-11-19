@@ -61,16 +61,16 @@ class MessageWatcher:
         self.dec = decryptor
         self.parser = parser
         self.out_dir = Path(out_dir)
-        (self.out_dir / "chats").mkdir(parents=True, exist_ok=True)
+        if persist:
+            (self.out_dir / "chats").mkdir(parents=True, exist_ok=True)
         self.verbose = verbose
         self.persist = persist
         self.on_message = on_message
         self._state_file = self.out_dir / "state.json"
-        self._cursors: dict[str, int] = self._load_state()
+        self._cursors: dict[str, int] = self._load_state() if persist else {}
         self._observer: Observer | None = None
         self._running = False
         self._lock = threading.Lock()
-        self._file_names: dict[str, str] = {}  # safe_name -> username（撞名检测）
 
     def _load_state(self) -> dict[str, int]:
         if self._state_file.exists():
@@ -81,6 +81,8 @@ class MessageWatcher:
         return {}
 
     def _save_state(self):
+        if not self.persist:
+            return
         self._state_file.write_text(json.dumps(self._cursors), encoding="utf-8")
 
     # ---------- 输出 ----------
@@ -97,15 +99,10 @@ class MessageWatcher:
         # 全局流（显式 UTF-8：Windows 控制台区域写入不能依赖默认编码）
         with open(self.out_dir / "messages.jsonl", "a", encoding="utf-8") as f:
             f.write(line + "\n")
-        # 每会话流（同名会话用 username 的 md5 后缀区分，避免互相覆盖）
+        # 固定附加完整会话 ID 摘要，保证同名、清洗后同名和重启后的会话始终隔离。
         name = msg.get("talker_name") or msg["talker"]
         safe = "".join(c if c.isalnum() or c in " _-@" else "_" for c in name)[:64].strip()
-        prev = self._file_names.get(safe)
-        suffix = md5(msg["talker"])[:6]
-        if prev is not None and prev != msg["talker"]:
-            safe = f"{safe}__{suffix}"
-        else:
-            self._file_names.setdefault(safe, msg["talker"])
+        safe = f"{safe}__{md5(msg['talker'])}"
         with open(self.out_dir / "chats" / f"{safe}.jsonl", "a", encoding="utf-8") as f:
             f.write(line + "\n")
         if self.verbose:
@@ -152,6 +149,8 @@ class MessageWatcher:
             return count
 
     def refresh_conversations(self):
+        if not self.persist:
+            return
         try:
             sessions = self.parser.sessions()
             with open(self.out_dir / "conversations.json", "w", encoding="utf-8") as f:
